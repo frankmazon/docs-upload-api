@@ -118,25 +118,99 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
         files = req.files
 
         uploaded_file = files.get("file")
+
         if not uploaded_file:
             return add_cors(func.HttpResponse(
-                json.dumps({"success": False, "message": "No file uploaded."}),
+                json.dumps({
+                    "success": False,
+                    "message": "No file uploaded."
+                }),
                 status_code=400,
                 mimetype="application/json"
             ))
 
-        first_name = form.get("firstName", "")
-        middle_name = form.get("middleName", "")
-        last_name = form.get("lastName", "")
-        email = form.get("email", "")
-        document_type = form.get("documentType", "")
+        existing_unique_id = form.get("uniqueId", "").strip()
 
-        unique_id = f"CL-{uuid.uuid4().hex[:8].upper()}"
+        first_name = form.get("firstName", "").strip()
+        middle_name = form.get("middleName", "").strip()
+        last_name = form.get("lastName", "").strip()
+        email = form.get("email", "").strip()
+        document_type = form.get("documentType", "").strip()
+
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+
+        if existing_unique_id:
+            cursor.execute("""
+                SELECT TOP 1
+                    Id,
+                    UniqueId,
+                    FirstName,
+                    MiddleName,
+                    LastName,
+                    Email
+                FROM Clients
+                WHERE UniqueId = ?
+            """, existing_unique_id)
+
+            existing_client = cursor.fetchone()
+
+            if not existing_client:
+                cursor.close()
+                conn.close()
+
+                return add_cors(func.HttpResponse(
+                    json.dumps({
+                        "success": False,
+                        "message": "Client Unique ID not found."
+                    }),
+                    status_code=404,
+                    mimetype="application/json"
+                ))
+
+            client_id = existing_client.Id
+            unique_id = existing_client.UniqueId
+
+            first_name = first_name or existing_client.FirstName or ""
+            middle_name = middle_name or existing_client.MiddleName or ""
+            last_name = last_name or existing_client.LastName or ""
+            email = email or existing_client.Email or ""
+
+        else:
+            unique_id = f"CL-{uuid.uuid4().hex[:8].upper()}"
+
+            cursor.execute("""
+                INSERT INTO Clients (
+                    UniqueId,
+                    FirstName,
+                    MiddleName,
+                    LastName,
+                    Email,
+                    DocumentType,
+                    FileName,
+                    FileUrl
+                )
+                OUTPUT INSERTED.Id
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                unique_id,
+                first_name,
+                middle_name,
+                last_name,
+                email,
+                document_type,
+                uploaded_file.filename,
+                ""
+            ))
+
+            client_id = cursor.fetchone()[0]
 
         storage_connection_string = os.getenv("STORAGE_CONNECTION_STRING")
         container_name = os.getenv("BLOB_CONTAINER_NAME", "client-files")
 
-        blob_service = BlobServiceClient.from_connection_string(storage_connection_string)
+        blob_service = BlobServiceClient.from_connection_string(
+            storage_connection_string
+        )
         container_client = blob_service.get_container_client(container_name)
 
         safe_filename = uploaded_file.filename.replace(" ", "_")
@@ -146,35 +220,6 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
         blob_client.upload_blob(uploaded_file.stream.read(), overwrite=True)
 
         blob_url = blob_client.url
-
-        conn = get_sql_connection()
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            INSERT INTO Clients (
-                UniqueId,
-                FirstName,
-                MiddleName,
-                LastName,
-                Email,
-                DocumentType,
-                FileName,
-                FileUrl
-            )
-            OUTPUT INSERTED.Id
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            unique_id,
-            first_name,
-            middle_name,
-            last_name,
-            email,
-            document_type,
-            uploaded_file.filename,
-            blob_url
-        ))
-
-        client_id = cursor.fetchone()[0]
 
         cursor.execute("""
             INSERT INTO Documents (
@@ -189,6 +234,20 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
             document_type,
             uploaded_file.filename,
             blob_url
+        ))
+
+        cursor.execute("""
+            UPDATE Clients
+            SET
+                DocumentType = ?,
+                FileName = ?,
+                FileUrl = ?
+            WHERE Id = ?
+        """, (
+            document_type,
+            uploaded_file.filename,
+            blob_url,
+            client_id
         ))
 
         conn.commit()
@@ -210,7 +269,10 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.exception("Upload failed.")
         return add_cors(func.HttpResponse(
-            json.dumps({"success": False, "message": str(e)}),
+            json.dumps({
+                "success": False,
+                "message": str(e)
+            }),
             status_code=500,
             mimetype="application/json"
         ))
@@ -231,18 +293,19 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
 
         query = """
             SELECT
-                c.Id,
+                c.Id AS ClientId,
                 c.UniqueId,
                 c.FirstName,
                 c.MiddleName,
                 c.LastName,
                 c.Email,
+                d.Id AS DocumentId,
                 d.DocumentType,
                 d.FileName,
                 d.BlobUrl,
                 d.UploadedAt
             FROM Clients c
-            LEFT JOIN Documents d ON d.ClientId = c.Id
+            INNER JOIN Documents d ON d.ClientId = c.Id
             WHERE 1 = 1
         """
 
@@ -265,25 +328,32 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
                     OR c.LastName LIKE ?
                     OR c.Email LIKE ?
                     OR d.FileName LIKE ?
+                    OR d.DocumentType LIKE ?
                 )
             """
             like = f"%{search}%"
-            params.extend([like, like, like, like, like, like])
+            params.extend([like, like, like, like, like, like, like])
 
-        query += " ORDER BY c.Id DESC"
+        query += " ORDER BY d.UploadedAt DESC"
 
         cursor.execute(query, params)
         rows = cursor.fetchall()
 
         clients = []
+
         for row in rows:
             clients.append({
-                "id": row.Id,
+                "id": row.DocumentId,
+                "clientId": row.ClientId,
                 "uniqueId": row.UniqueId,
                 "firstName": row.FirstName,
                 "middleName": row.MiddleName,
                 "lastName": row.LastName,
-                "name": " ".join(filter(None, [row.FirstName, row.MiddleName, row.LastName])),
+                "name": " ".join(filter(None, [
+                    row.FirstName,
+                    row.MiddleName,
+                    row.LastName
+                ])),
                 "email": row.Email,
                 "documentType": row.DocumentType,
                 "fileName": row.FileName,
@@ -295,7 +365,10 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
         conn.close()
 
         return add_cors(func.HttpResponse(
-            json.dumps({"success": True, "clients": clients}),
+            json.dumps({
+                "success": True,
+                "clients": clients
+            }),
             status_code=200,
             mimetype="application/json"
         ))
@@ -303,7 +376,10 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.exception("Fetch clients failed.")
         return add_cors(func.HttpResponse(
-            json.dumps({"success": False, "message": str(e)}),
+            json.dumps({
+                "success": False,
+                "message": str(e)
+            }),
             status_code=500,
             mimetype="application/json"
         ))
