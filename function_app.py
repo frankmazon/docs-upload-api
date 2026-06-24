@@ -4,7 +4,13 @@ import os
 import json
 import uuid
 import pyodbc
-from azure.storage.blob import BlobServiceClient
+from datetime import datetime, timedelta
+from urllib.parse import urlparse, unquote
+from azure.storage.blob import (
+    BlobServiceClient,
+    generate_blob_sas,
+    BlobSasPermissions,
+)
 
 app = func.FunctionApp()
 
@@ -37,7 +43,6 @@ def login(req: func.HttpRequest) -> func.HttpResponse:
 
     try:
         data = req.get_json()
-
         username = data.get("username", "").strip()
         password = data.get("password", "").strip()
 
@@ -55,17 +60,11 @@ def login(req: func.HttpRequest) -> func.HttpResponse:
         cursor = conn.cursor()
 
         cursor.execute("""
-            SELECT
-                Id,
-                Username,
-                Role
+            SELECT Id, Username, Role
             FROM Users
             WHERE Username = ?
             AND Password = ?
-        """, (
-            username,
-            password
-        ))
+        """, (username, password))
 
         user = cursor.fetchone()
 
@@ -116,7 +115,6 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
     try:
         form = req.form
         files = req.files
-
         uploaded_file = files.get("file")
 
         if not uploaded_file:
@@ -130,7 +128,6 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
             ))
 
         existing_unique_id = form.get("uniqueId", "").strip()
-
         first_name = form.get("firstName", "").strip()
         middle_name = form.get("middleName", "").strip()
         last_name = form.get("lastName", "").strip()
@@ -170,7 +167,6 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
 
             client_id = existing_client.Id
             unique_id = existing_client.UniqueId
-
             first_name = first_name or existing_client.FirstName or ""
             middle_name = middle_name or existing_client.MiddleName or ""
             last_name = last_name or existing_client.LastName or ""
@@ -268,6 +264,83 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
 
     except Exception as e:
         logging.exception("Upload failed.")
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": False,
+                "message": str(e)
+            }),
+            status_code=500,
+            mimetype="application/json"
+        ))
+
+
+@app.route(route="file-url", auth_level=func.AuthLevel.ANONYMOUS, methods=["GET", "OPTIONS"])
+def get_file_url(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    try:
+        blob_url = req.params.get("blobUrl")
+
+        if not blob_url:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "blobUrl is required."
+                }),
+                status_code=400,
+                mimetype="application/json"
+            ))
+
+        storage_connection_string = os.getenv("STORAGE_CONNECTION_STRING")
+        container_name = os.getenv("BLOB_CONTAINER_NAME", "client-files")
+
+        parsed_url = urlparse(blob_url)
+        path_parts = parsed_url.path.lstrip("/").split("/", 1)
+
+        if len(path_parts) < 2:
+            raise Exception("Invalid blob URL.")
+
+        blob_name = unquote(path_parts[1])
+
+        account_name = (
+            storage_connection_string
+            .split("AccountName=")[1]
+            .split(";")[0]
+        )
+
+        account_key = (
+            storage_connection_string
+            .split("AccountKey=")[1]
+            .split(";")[0]
+        )
+
+        sas_token = generate_blob_sas(
+            account_name=account_name,
+            container_name=container_name,
+            blob_name=blob_name,
+            account_key=account_key,
+            permission=BlobSasPermissions(read=True),
+            expiry=datetime.utcnow() + timedelta(minutes=30),
+        )
+
+        secure_url = (
+            f"https://{account_name}.blob.core.windows.net/"
+            f"{container_name}/{blob_name}?{sas_token}"
+        )
+
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": True,
+                "url": secure_url,
+                "expiresInMinutes": 30
+            }),
+            status_code=200,
+            mimetype="application/json"
+        ))
+
+    except Exception as e:
+        logging.exception("Generate secure URL failed.")
         return add_cors(func.HttpResponse(
             json.dumps({
                 "success": False,
