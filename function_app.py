@@ -456,3 +456,91 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         ))
+
+@app.route(route="client-login", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST", "OPTIONS"])
+def client_login(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    try:
+        data = req.get_json()
+
+        unique_id = data.get("uniqueId", "").strip()
+        password = data.get("password", "").strip()
+
+        if not unique_id or not password:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "Client ID and password are required."
+                }),
+                status_code=400,
+                mimetype="application/json"
+            ))
+
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT TOP 1
+                Id,
+                UniqueId,
+                FirstName,
+                MiddleName,
+                LastName,
+                Email
+            FROM Clients
+            WHERE UniqueId = ?
+            AND LOWER(LastName) = LOWER(?)
+        """, (
+            unique_id,
+            password
+        ))
+
+        client = cursor.fetchone()
+
+        cursor.close()
+        conn.close()
+
+        if not client:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "Invalid Client ID or password."
+                }),
+                status_code=401,
+                mimetype="application/json"
+            ))
+
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": True,
+                "message": "Client login successful.",
+                "client": {
+                    "id": client.Id,
+                    "uniqueId": client.UniqueId,
+                    "firstName": client.FirstName,
+                    "middleName": client.MiddleName,
+                    "lastName": client.LastName,
+                    "email": client.Email,
+                    "name": " ".join(filter(None, [
+                        client.FirstName,
+                        client.MiddleName,
+                        client.LastName
+                    ]))
+                }
+            }),
+            status_code=200,
+            mimetype="application/json"
+        ))
+
+    except Exception as e:
+        logging.exception("Client login failed.")
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": False,
+                "message": str(e)
+            }),
+            status_code=500,
+            mimetype="application/json"
+        ))
