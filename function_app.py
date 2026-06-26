@@ -4,6 +4,7 @@ import os
 import json
 import uuid
 import pyodbc
+import requests
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, unquote
 from azure.storage.blob import (
@@ -13,6 +14,22 @@ from azure.storage.blob import (
 )
 
 app = func.FunctionApp()
+
+REQUIRED_DOCUMENTS = [
+    "id",
+    "property-documents",
+    "credit-history",
+    "income-documents",
+    "other",
+]
+
+DOCUMENT_LABELS = {
+    "id": "ID",
+    "property-documents": "Property Documents",
+    "credit-history": "Credit History",
+    "income-documents": "Income Documents",
+    "other": "Other",
+}
 
 
 def add_cors(response: func.HttpResponse) -> func.HttpResponse:
@@ -34,6 +51,198 @@ def get_sql_connection():
         "Connection Timeout=30;"
     )
     return pyodbc.connect(conn_str)
+
+
+def format_document_type(document_type: str) -> str:
+    clean_type = (document_type or "").strip().lower()
+    return DOCUMENT_LABELS.get(
+        clean_type,
+        clean_type.replace("-", " ").title() if clean_type else "Document",
+    )
+
+
+def get_client_document_status(cursor, client_id: int):
+    cursor.execute("""
+        SELECT DISTINCT DocumentType
+        FROM Documents
+        WHERE ClientId = ?
+    """, client_id)
+
+    rows = cursor.fetchall()
+
+    uploaded_raw = [
+        (row.DocumentType or "").strip().lower()
+        for row in rows
+        if row.DocumentType
+    ]
+
+    uploaded_documents = sorted(set(uploaded_raw))
+
+    missing_documents = [
+        document_type
+        for document_type in REQUIRED_DOCUMENTS
+        if document_type not in uploaded_documents
+    ]
+
+    return {
+        "uploadedDocuments": uploaded_documents,
+        "missingDocuments": missing_documents,
+        "isComplete": len(missing_documents) == 0,
+    }
+
+
+def get_ghl_headers():
+    token = os.getenv("GHL_ACCESS_TOKEN", "").strip()
+
+    return {
+        "Authorization": f"Bearer {token}",
+        "Version": "2021-07-28",
+        "Content-Type": "application/json",
+    }
+
+
+def build_ghl_custom_fields(unique_id, document_status, missing_documents):
+    custom_fields = []
+
+    client_id_field = os.getenv("GHL_CUSTOM_FIELD_CLIENT_ID", "").strip()
+    status_field = os.getenv("GHL_CUSTOM_FIELD_DOCUMENT_STATUS", "").strip()
+    missing_docs_field = os.getenv("GHL_CUSTOM_FIELD_MISSING_DOCUMENTS", "").strip()
+
+    if client_id_field:
+        custom_fields.append({
+            "id": client_id_field,
+            "field_value": unique_id,
+        })
+
+    if status_field:
+        custom_fields.append({
+            "id": status_field,
+            "field_value": document_status,
+        })
+
+    if missing_docs_field:
+        custom_fields.append({
+            "id": missing_docs_field,
+            "field_value": ", ".join(missing_documents),
+        })
+
+    return custom_fields
+
+
+def sync_client_to_ghl(
+    unique_id,
+    first_name,
+    middle_name,
+    last_name,
+    email,
+    uploaded_documents,
+    missing_documents,
+):
+    try:
+        ghl_api_base = os.getenv(
+            "GHL_API_BASE",
+            "https://services.leadconnectorhq.com",
+        ).rstrip("/")
+
+        ghl_token = os.getenv("GHL_ACCESS_TOKEN", "").strip()
+        location_id = os.getenv("GHL_LOCATION_ID", "").strip()
+
+        if not ghl_token:
+            logging.warning("GHL sync skipped. Missing GHL_ACCESS_TOKEN.")
+            return {
+                "success": False,
+                "skipped": True,
+                "message": "Missing GHL_ACCESS_TOKEN.",
+            }
+
+        if not location_id:
+            logging.warning("GHL sync skipped. Missing GHL_LOCATION_ID.")
+            return {
+                "success": False,
+                "skipped": True,
+                "message": "Missing GHL_LOCATION_ID.",
+            }
+
+        if not email:
+            logging.warning("GHL sync skipped. Missing client email.")
+            return {
+                "success": False,
+                "skipped": True,
+                "message": "Missing client email.",
+            }
+
+        uploaded_labels = [
+            format_document_type(document_type)
+            for document_type in uploaded_documents
+        ]
+
+        missing_labels = [
+            format_document_type(document_type)
+            for document_type in missing_documents
+        ]
+
+        is_complete = len(missing_documents) == 0
+        document_status = "Complete" if is_complete else "Incomplete"
+
+        full_name = " ".join(
+            filter(None, [first_name, middle_name, last_name])
+        ).strip()
+
+        tags = [
+            "Azure Client Portal",
+            "Documents Complete" if is_complete else "Documents Incomplete",
+        ]
+
+        for label in uploaded_labels:
+            tags.append(f"Uploaded: {label}")
+
+        for label in missing_labels:
+            tags.append(f"Missing: {label}")
+
+        payload = {
+            "locationId": location_id,
+            "firstName": first_name or "",
+            "lastName": last_name or "",
+            "name": full_name,
+            "email": email,
+            "tags": tags,
+        }
+
+        custom_fields = build_ghl_custom_fields(
+            unique_id=unique_id,
+            document_status=document_status,
+            missing_documents=missing_labels,
+        )
+
+        if custom_fields:
+            payload["customFields"] = custom_fields
+
+        response = requests.post(
+            f"{ghl_api_base}/contacts/upsert",
+            headers=get_ghl_headers(),
+            json=payload,
+            timeout=30,
+        )
+
+        logging.info(
+            "GHL sync response: %s %s",
+            response.status_code,
+            response.text,
+        )
+
+        return {
+            "success": response.status_code in [200, 201],
+            "statusCode": response.status_code,
+            "body": response.text,
+        }
+
+    except Exception as e:
+        logging.exception("GHL sync failed.")
+        return {
+            "success": False,
+            "statusCode": 500,
+            "message": str(e),
+        }
 
 
 @app.route(route="login", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST", "OPTIONS"])
@@ -246,9 +455,21 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
             client_id
         ))
 
+        document_status = get_client_document_status(cursor, client_id)
+
         conn.commit()
         cursor.close()
         conn.close()
+
+        ghl_sync = sync_client_to_ghl(
+            unique_id=unique_id,
+            first_name=first_name,
+            middle_name=middle_name,
+            last_name=last_name,
+            email=email,
+            uploaded_documents=document_status["uploadedDocuments"],
+            missing_documents=document_status["missingDocuments"],
+        )
 
         return add_cors(func.HttpResponse(
             json.dumps({
@@ -256,7 +477,19 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
                 "message": "Client document uploaded successfully.",
                 "clientId": client_id,
                 "uniqueId": unique_id,
-                "blobUrl": blob_url
+                "blobUrl": blob_url,
+                "documentStatus": {
+                    "uploadedDocuments": [
+                        format_document_type(item)
+                        for item in document_status["uploadedDocuments"]
+                    ],
+                    "missingDocuments": [
+                        format_document_type(item)
+                        for item in document_status["missingDocuments"]
+                    ],
+                    "isComplete": document_status["isComplete"],
+                },
+                "ghlSync": ghl_sync,
             }),
             status_code=200,
             mimetype="application/json"
@@ -456,6 +689,7 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         ))
+
 
 @app.route(route="client-login", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST", "OPTIONS"])
 def client_login(req: func.HttpRequest) -> func.HttpResponse:
