@@ -31,6 +31,13 @@ DOCUMENT_LABELS = {
     "other": "Other",
 }
 
+LEAD_TYPE_LABELS = {
+    "business_owner": "Business Owner",
+    "business-owner": "Business Owner",
+    "business owner": "Business Owner",
+    "referrer": "Referrer",
+}
+
 
 def add_cors(response: func.HttpResponse) -> func.HttpResponse:
     response.headers["Access-Control-Allow-Origin"] = "*"
@@ -59,6 +66,11 @@ def format_document_type(document_type: str) -> str:
         clean_type,
         clean_type.replace("-", " ").title() if clean_type else "Document",
     )
+
+
+def format_lead_type(lead_type: str) -> str:
+    clean_type = (lead_type or "business_owner").strip().lower()
+    return LEAD_TYPE_LABELS.get(clean_type, "Business Owner")
 
 
 def get_client_document_status(cursor, client_id: int):
@@ -135,6 +147,8 @@ def sync_client_to_ghl(
     middle_name,
     last_name,
     email,
+    phone,
+    lead_type,
     uploaded_documents,
     missing_documents,
 ):
@@ -183,6 +197,7 @@ def sync_client_to_ghl(
 
         is_complete = len(missing_documents) == 0
         document_status = "Complete" if is_complete else "Incomplete"
+        lead_label = format_lead_type(lead_type)
 
         full_name = " ".join(
             filter(None, [first_name, middle_name, last_name])
@@ -190,6 +205,9 @@ def sync_client_to_ghl(
 
         tags = [
             "Azure Client Portal",
+            "Website Intake",
+            lead_label,
+            "Pending Team Call",
             "Documents Complete" if is_complete else "Documents Incomplete",
         ]
 
@@ -205,6 +223,8 @@ def sync_client_to_ghl(
             "lastName": last_name or "",
             "name": full_name,
             "email": email,
+            "phone": phone or "",
+            "source": "Website Intake",
             "tags": tags,
         }
 
@@ -230,10 +250,16 @@ def sync_client_to_ghl(
             response.text,
         )
 
+        parsed_body = None
+        try:
+            parsed_body = response.json()
+        except Exception:
+            parsed_body = response.text
+
         return {
             "success": response.status_code in [200, 201],
             "statusCode": response.status_code,
-            "body": response.text,
+            "body": parsed_body,
         }
 
     except Exception as e:
@@ -341,6 +367,8 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
         middle_name = form.get("middleName", "").strip()
         last_name = form.get("lastName", "").strip()
         email = form.get("email", "").strip()
+        phone = form.get("phone", "").strip()
+        lead_type = form.get("leadType", "business_owner").strip().lower()
         document_type = form.get("documentType", "").strip()
 
         conn = get_sql_connection()
@@ -467,6 +495,8 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
             middle_name=middle_name,
             last_name=last_name,
             email=email,
+            phone=phone,
+            lead_type=lead_type,
             uploaded_documents=document_status["uploadedDocuments"],
             missing_documents=document_status["missingDocuments"],
         )
@@ -478,6 +508,8 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
                 "clientId": client_id,
                 "uniqueId": unique_id,
                 "blobUrl": blob_url,
+                "leadType": format_lead_type(lead_type),
+                "status": "Pending Team Call",
                 "documentStatus": {
                     "uploadedDocuments": [
                         format_document_type(item)
