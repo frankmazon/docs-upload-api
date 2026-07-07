@@ -5,6 +5,7 @@ import json
 import uuid
 import pyodbc
 import requests
+import re
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, unquote
 from azure.storage.blob import (
@@ -14,6 +15,8 @@ from azure.storage.blob import (
 )
 
 app = func.FunctionApp()
+
+_GHL_FIELD_MAP_CACHE = None
 
 REQUIRED_DOCUMENTS = [
     "id",
@@ -31,10 +34,55 @@ DOCUMENT_LABELS = {
     "other": "Other",
 }
 
+
+GHL_CUSTOM_FIELD_CONFIG = {
+    "GHL_CUSTOM_FIELD_CLIENT_ID": ["client_id", "unique_id"],
+    "GHL_CUSTOM_FIELD_DOCUMENT_STATUS": ["document_status"],
+    "GHL_CUSTOM_FIELD_MISSING_DOCUMENTS": ["missing_documents"],
+    "GHL_APPLICATION_SOURCE_FIELD": ["application_source"],
+    "GHL_CLASSIFICATION_FIELD": ["classification_type"],
+    "GHL_BORROWER_FIELD": ["borrower_type"],
+    "GHL_OBJECTIVE_FIELD": ["objective"],
+    "GHL_LOAN_TYPE_FIELD": ["loan_type"],
+    "GHL_PURPOSE_FIELD": ["purpose"],
+    "GHL_TRANSACTION_FIELD": ["transaction_type"],
+    "GHL_WITH_BORROWERS_GUARANTORS_FIELD": [
+        "with_borrowers__guarantors",
+        "with_borrowers_guarantors",
+        "with_borrowers_guarantors?",
+    ],
+    "GHL_SETTLEMENT_FIELD": [
+        "anticipated_settlement_date",
+        "settlement_date",
+    ],
+    "GHL_REFERRER_FIRST_NAME_FIELD": ["referrer_first_name"],
+    "GHL_REFERRER_MIDDLE_NAME_FIELD": ["referrer_middle_name"],
+    "GHL_REFERRER_LAST_NAME_FIELD": ["referrer_last_name"],
+    "GHL_REFERRER_PHONE_FIELD": ["referrer_phone", "referrer_mobile"],
+    "GHL_REFERRER_EMAIL_FIELD": ["referrer_email"],
+}
+
+REQUIRED_INTAKE_FIELDS = {
+    "email": "Email",
+    "phone": "Phone number",
+    "source": "Source",
+    "classificationType": "Classification type",
+    "borrowerType": "Borrower type",
+    "objective": "Objective",
+    "loanType": "Loan Type",
+    "purpose": "Purpose",
+    "transactionType": "Transaction type",
+    "anticipatedSettlementDate": "Anticipated Settlement Date",
+}
+
 LEAD_TYPE_LABELS = {
     "business_owner": "Business Owner",
     "business-owner": "Business Owner",
     "business owner": "Business Owner",
+    "broker": "Broker",
+    "referral": "Referral",
+    "direct-client": "Direct Client",
+    "direct client": "Direct Client",
     "referrer": "Referrer",
 }
 
@@ -42,7 +90,7 @@ LEAD_TYPE_LABELS = {
 def add_cors(response: func.HttpResponse) -> func.HttpResponse:
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
 
 
@@ -60,6 +108,64 @@ def get_sql_connection():
     return pyodbc.connect(conn_str)
 
 
+def clean_value(value):
+    return (value or "").strip()
+
+
+def none_if_empty(value):
+    value = clean_value(value)
+    return value if value else None
+
+
+def get_form_value(form, *keys):
+    for key in keys:
+        value = form.get(key)
+        if value not in [None, ""]:
+            return clean_value(value)
+    return ""
+
+
+def get_optional_form_value(form, *keys):
+    value = get_form_value(form, *keys)
+    return value if value else None
+
+
+def extract_ghl_contact_id(ghl_sync):
+    body = ghl_sync.get("body") if isinstance(ghl_sync, dict) else None
+
+    if not isinstance(body, dict):
+        return ""
+
+    direct_keys = ["id", "_id", "contactId", "contact_id"]
+    for key in direct_keys:
+        value = clean_value(body.get(key))
+        if value:
+            return value
+
+    contact = body.get("contact")
+    if isinstance(contact, dict):
+        for key in direct_keys:
+            value = clean_value(contact.get(key))
+            if value:
+                return value
+
+    data = body.get("data")
+    if isinstance(data, dict):
+        for key in direct_keys:
+            value = clean_value(data.get(key))
+            if value:
+                return value
+
+        contact = data.get("contact")
+        if isinstance(contact, dict):
+            for key in direct_keys:
+                value = clean_value(contact.get(key))
+                if value:
+                    return value
+
+    return ""
+
+
 def format_document_type(document_type: str) -> str:
     clean_type = (document_type or "").strip().lower()
     return DOCUMENT_LABELS.get(
@@ -69,8 +175,8 @@ def format_document_type(document_type: str) -> str:
 
 
 def format_lead_type(lead_type: str) -> str:
-    clean_type = (lead_type or "business_owner").strip().lower()
-    return LEAD_TYPE_LABELS.get(clean_type, "Business Owner")
+    clean_type = (lead_type or "broker").strip().lower()
+    return LEAD_TYPE_LABELS.get(clean_type, clean_type.replace("-", " ").title())
 
 
 def get_client_document_status(cursor, client_id: int):
@@ -113,33 +219,277 @@ def get_ghl_headers():
     }
 
 
-def build_ghl_custom_fields(unique_id, document_status, missing_documents):
+def normalize_ghl_key(value):
+    raw = (value or "").strip()
+
+    if not raw:
+        return ""
+
+    raw = raw.replace("{{", "").replace("}}", "")
+    raw = raw.replace("contact.", "")
+    raw = raw.replace("customFields.", "")
+    raw = raw.replace("custom_fields.", "")
+    raw = raw.strip().lower()
+    raw = re.sub(r"[^a-z0-9]+", "_", raw)
+    raw = re.sub(r"_+", "_", raw).strip("_")
+
+    return raw
+
+
+def normalize_ghl_field_value(field_key, value):
+    value = clean_value(value)
+
+    if not value:
+        return ""
+
+    normalized_key = normalize_ghl_key(field_key)
+    normalized_value = normalize_ghl_key(value)
+
+    dropdown_value_map = {
+        "classification_type": {
+            "residential": "residential",
+            "commercial": "commercial",
+        },
+        "borrower_type": {
+            "individual": "individual",
+            "company": "company",
+        },
+        "objective": {
+            "purchase": "purchase",
+            "refinance": "refinance",
+            "refinancing": "refinance",
+            "asset_finance": "asset_finance",
+            "construction": "construction",
+            "development": "development",
+            "personal_loan": "personal_loan",
+            "business_loan": "business_loan",
+        },
+        "loan_type": {
+            "residential": "residential",
+            "commercial": "commercial",
+        },
+        "purpose": {
+            "investment": "investment",
+            "owner_occupied": "owner_occupied",
+        },
+        "transaction_type": {
+            "alt_doc": "alt_doc",
+            "full_doc": "full_doc",
+        },
+        "application_source": {
+            "broker": "broker",
+            "referral": "referral",
+            "direct_client": "direct_client",
+            "directclient": "direct_client",
+        },
+        "with_borrowers_guarantors": {
+            "yes": "yes",
+            "no": "no",
+        },
+        "with_borrowers__guarantors": {
+            "yes": "yes",
+            "no": "no",
+        },
+    }
+
+    return dropdown_value_map.get(normalized_key, {}).get(normalized_value, value)
+
+
+def extract_ghl_custom_fields(response_body):
+    if isinstance(response_body, list):
+        return response_body
+
+    if not isinstance(response_body, dict):
+        return []
+
+    for key in [
+        "customFields",
+        "custom_fields",
+        "fields",
+        "data",
+        "items",
+    ]:
+        fields = response_body.get(key)
+
+        if isinstance(fields, list):
+            return fields
+
+    return []
+
+
+def get_ghl_custom_field_map(ghl_api_base, location_id):
+    global _GHL_FIELD_MAP_CACHE
+
+    if _GHL_FIELD_MAP_CACHE is not None:
+        return _GHL_FIELD_MAP_CACHE
+
+    field_map = {}
+
+    if not ghl_api_base or not location_id:
+        return field_map
+
+    try:
+        response = requests.get(
+            f"{ghl_api_base}/locations/{location_id}/customFields",
+            headers=get_ghl_headers(),
+            timeout=30,
+        )
+
+        logging.info(
+            "GHL custom fields response: %s %s",
+            response.status_code,
+            response.text[:1000],
+        )
+
+        if response.status_code not in [200, 201]:
+            return field_map
+
+        response_body = response.json()
+        fields = extract_ghl_custom_fields(response_body)
+
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+
+            field_id = clean_value(
+                field.get("id")
+                or field.get("_id")
+                or field.get("fieldId")
+                or field.get("field_id")
+            )
+
+            if not field_id:
+                continue
+
+            raw_keys = [
+                field.get("fieldKey"),
+                field.get("field_key"),
+                field.get("key"),
+                field.get("name"),
+                field.get("fieldName"),
+                field.get("field_name"),
+            ]
+
+            for raw_key in raw_keys:
+                normalized_key = normalize_ghl_key(str(raw_key or ""))
+
+                if normalized_key:
+                    field_map[normalized_key] = field_id
+
+    except Exception:
+        logging.exception("Failed to load GHL custom fields.")
+
+    _GHL_FIELD_MAP_CACHE = field_map
+    return field_map
+
+
+def get_ghl_field_id(env_name, ghl_field_map=None):
+    env_field_id = os.getenv(env_name, "").strip()
+
+    if env_field_id:
+        return env_field_id
+
+    for field_key in GHL_CUSTOM_FIELD_CONFIG.get(env_name, []):
+        normalized_key = normalize_ghl_key(field_key)
+
+        if normalized_key and ghl_field_map and normalized_key in ghl_field_map:
+            return ghl_field_map[normalized_key]
+
+    return ""
+
+
+def add_ghl_field(custom_fields, env_name, field_value, ghl_field_map=None):
+    if field_value in [None, ""]:
+        return
+
+    field_id = get_ghl_field_id(env_name, ghl_field_map)
+
+    if not field_id:
+        logging.warning("GHL custom field skipped. Missing field ID for %s.", env_name)
+        return
+
+    field_key = (
+        GHL_CUSTOM_FIELD_CONFIG.get(env_name, [env_name])[0]
+        if GHL_CUSTOM_FIELD_CONFIG.get(env_name)
+        else env_name
+    )
+
+    custom_fields.append({
+        "id": field_id,
+        "field_value": normalize_ghl_field_value(field_key, field_value),
+    })
+
+
+def build_ghl_custom_fields(
+    unique_id,
+    document_status,
+    missing_documents,
+    source,
+    classification_type,
+    borrower_type,
+    objective,
+    loan_type,
+    purpose,
+    transaction_type,
+    with_borrowers_guarantors,
+    anticipated_settlement_date,
+    referrer_first_name,
+    referrer_middle_name,
+    referrer_last_name,
+    referrer_phone,
+    referrer_email,
+    ghl_field_map=None,
+):
     custom_fields = []
 
-    client_id_field = os.getenv("GHL_CUSTOM_FIELD_CLIENT_ID", "").strip()
-    status_field = os.getenv("GHL_CUSTOM_FIELD_DOCUMENT_STATUS", "").strip()
-    missing_docs_field = os.getenv("GHL_CUSTOM_FIELD_MISSING_DOCUMENTS", "").strip()
+    add_ghl_field(
+        custom_fields,
+        "GHL_CUSTOM_FIELD_CLIENT_ID",
+        unique_id,
+        ghl_field_map,
+    )
 
-    if client_id_field:
-        custom_fields.append({
-            "id": client_id_field,
-            "field_value": unique_id,
-        })
+    add_ghl_field(
+        custom_fields,
+        "GHL_CUSTOM_FIELD_DOCUMENT_STATUS",
+        document_status,
+        ghl_field_map,
+    )
 
-    if status_field:
-        custom_fields.append({
-            "id": status_field,
-            "field_value": document_status,
-        })
+    add_ghl_field(
+        custom_fields,
+        "GHL_CUSTOM_FIELD_MISSING_DOCUMENTS",
+        ", ".join(missing_documents),
+        ghl_field_map,
+    )
 
-    if missing_docs_field:
-        custom_fields.append({
-            "id": missing_docs_field,
-            "field_value": ", ".join(missing_documents),
-        })
+    add_ghl_field(custom_fields, "GHL_APPLICATION_SOURCE_FIELD", source, ghl_field_map)
+    add_ghl_field(custom_fields, "GHL_CLASSIFICATION_FIELD", classification_type, ghl_field_map)
+    add_ghl_field(custom_fields, "GHL_BORROWER_FIELD", borrower_type, ghl_field_map)
+    add_ghl_field(custom_fields, "GHL_OBJECTIVE_FIELD", objective, ghl_field_map)
+    add_ghl_field(custom_fields, "GHL_LOAN_TYPE_FIELD", loan_type, ghl_field_map)
+    add_ghl_field(custom_fields, "GHL_PURPOSE_FIELD", purpose, ghl_field_map)
+    add_ghl_field(custom_fields, "GHL_TRANSACTION_FIELD", transaction_type, ghl_field_map)
+    add_ghl_field(
+        custom_fields,
+        "GHL_WITH_BORROWERS_GUARANTORS_FIELD",
+        with_borrowers_guarantors,
+        ghl_field_map,
+    )
+    add_ghl_field(
+        custom_fields,
+        "GHL_SETTLEMENT_FIELD",
+        anticipated_settlement_date,
+        ghl_field_map,
+    )
+
+    add_ghl_field(custom_fields, "GHL_REFERRER_FIRST_NAME_FIELD", referrer_first_name, ghl_field_map)
+    add_ghl_field(custom_fields, "GHL_REFERRER_MIDDLE_NAME_FIELD", referrer_middle_name, ghl_field_map)
+    add_ghl_field(custom_fields, "GHL_REFERRER_LAST_NAME_FIELD", referrer_last_name, ghl_field_map)
+    add_ghl_field(custom_fields, "GHL_REFERRER_PHONE_FIELD", referrer_phone, ghl_field_map)
+    add_ghl_field(custom_fields, "GHL_REFERRER_EMAIL_FIELD", referrer_email, ghl_field_map)
 
     return custom_fields
-
 
 def sync_client_to_ghl(
     unique_id,
@@ -149,6 +499,20 @@ def sync_client_to_ghl(
     email,
     phone,
     lead_type,
+    source,
+    classification_type,
+    borrower_type,
+    objective,
+    loan_type,
+    purpose,
+    transaction_type,
+    with_borrowers_guarantors,
+    anticipated_settlement_date,
+    referrer_first_name,
+    referrer_middle_name,
+    referrer_last_name,
+    referrer_phone,
+    referrer_email,
     uploaded_documents,
     missing_documents,
 ):
@@ -198,6 +562,7 @@ def sync_client_to_ghl(
         is_complete = len(missing_documents) == 0
         document_status = "Complete" if is_complete else "Incomplete"
         lead_label = format_lead_type(lead_type)
+        source_label = format_lead_type(source)
 
         full_name = " ".join(
             filter(None, [first_name, middle_name, last_name])
@@ -207,6 +572,7 @@ def sync_client_to_ghl(
             "Azure Client Portal",
             "Website Intake",
             lead_label,
+            source_label,
             "Pending Team Call",
             "Documents Complete" if is_complete else "Documents Incomplete",
         ]
@@ -224,14 +590,31 @@ def sync_client_to_ghl(
             "name": full_name,
             "email": email,
             "phone": phone or "",
-            "source": "Website Intake",
+            "source": source_label or "Website Intake",
             "tags": tags,
         }
+
+        ghl_field_map = get_ghl_custom_field_map(ghl_api_base, location_id)
 
         custom_fields = build_ghl_custom_fields(
             unique_id=unique_id,
             document_status=document_status,
             missing_documents=missing_labels,
+            source=source_label,
+            classification_type=classification_type,
+            borrower_type=borrower_type,
+            objective=objective,
+            loan_type=loan_type,
+            purpose=purpose,
+            transaction_type=transaction_type,
+            with_borrowers_guarantors=with_borrowers_guarantors,
+            anticipated_settlement_date=anticipated_settlement_date,
+            referrer_first_name=referrer_first_name,
+            referrer_middle_name=referrer_middle_name,
+            referrer_last_name=referrer_last_name,
+            referrer_phone=referrer_phone,
+            referrer_email=referrer_email,
+            ghl_field_map=ghl_field_map,
         )
 
         if custom_fields:
@@ -250,7 +633,6 @@ def sync_client_to_ghl(
             response.text,
         )
 
-        parsed_body = None
         try:
             parsed_body = response.json()
         except Exception:
@@ -269,6 +651,43 @@ def sync_client_to_ghl(
             "statusCode": 500,
             "message": str(e),
         }
+
+
+@app.route(route="ghl-custom-fields", auth_level=func.AuthLevel.ANONYMOUS, methods=["GET", "OPTIONS"])
+def debug_ghl_custom_fields(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    try:
+        ghl_api_base = os.getenv(
+            "GHL_API_BASE",
+            "https://services.leadconnectorhq.com",
+        ).rstrip("/")
+        location_id = os.getenv("GHL_LOCATION_ID", "").strip()
+
+        field_map = get_ghl_custom_field_map(ghl_api_base, location_id)
+
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": True,
+                "fieldMap": field_map,
+                "mappedKeys": sorted(field_map.keys()),
+                "count": len(field_map),
+            }),
+            status_code=200,
+            mimetype="application/json"
+        ))
+
+    except Exception as e:
+        logging.exception("Fetch GHL custom fields failed.")
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": False,
+                "message": str(e),
+            }),
+            status_code=500,
+            mimetype="application/json"
+        ))
 
 
 @app.route(route="login", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST", "OPTIONS"])
@@ -352,24 +771,109 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
         files = req.files
         uploaded_file = files.get("file")
 
-        if not uploaded_file:
+        existing_unique_id = clean_value(form.get("uniqueId"))
+        first_name = clean_value(form.get("firstName"))
+        middle_name = clean_value(form.get("middleName"))
+        last_name = clean_value(form.get("lastName"))
+        email = clean_value(form.get("email"))
+        phone = clean_value(form.get("phone"))
+
+        lead_type = clean_value(form.get("leadType") or form.get("source") or "Broker")
+        source = clean_value(form.get("source") or lead_type or "Broker")
+
+        document_type = clean_value(form.get("documentType"))
+        uploaded_filename = uploaded_file.filename if uploaded_file else ""
+        blob_url = ""
+
+        classification_type = get_form_value(form, "classificationType", "ClassificationType", "classification_type")
+        borrower_type = get_form_value(form, "borrowerType", "BorrowerType", "borrower_type")
+        objective = get_form_value(form, "objective", "Objective")
+        loan_type = get_form_value(form, "loanType", "LoanType", "loan_type")
+        purpose = get_form_value(form, "purpose", "Purpose")
+        transaction_type = get_form_value(form, "transactionType", "TransactionType", "transaction_type")
+        with_borrowers_guarantors = get_form_value(
+            form,
+            "withBorrowersGuarantors",
+            "WithBorrowersGuarantors",
+            "with_borrowers_guarantors",
+            "withBorrowers",
+            "WithBorrowers",
+        )
+        anticipated_settlement_date = get_form_value(
+            form,
+            "anticipatedSettlementDate",
+            "AnticipatedSettlementDate",
+            "anticipated_settlement_date",
+        )
+
+        veda_issues = get_form_value(form, "vedaIssues", "VedaIssues", "veda_issues")
+        conduct_issues = get_form_value(form, "conductIssues", "ConductIssues", "conduct_issues")
+        client_needs_objectives = get_form_value(
+            form,
+            "clientNeedsObjectives",
+            "ClientNeedsObjectives",
+            "client_needs_objectives",
+        )
+        applicant_background = get_form_value(
+            form,
+            "applicantBackground",
+            "ApplicantBackground",
+            "applicant_background",
+        )
+        explanation_of_income = get_form_value(
+            form,
+            "explanationOfIncome",
+            "ExplanationOfIncome",
+            "explanation_of_income",
+        )
+        security = get_form_value(form, "security", "Security")
+        loan_amount = get_optional_form_value(form, "loanAmount", "LoanAmount", "loan_amount")
+        security_value = get_optional_form_value(form, "securityValue", "SecurityValue", "security_value")
+        lvr = get_optional_form_value(form, "lvr", "Lvr", "LVR")
+        special_notes = get_form_value(form, "specialNotes", "SpecialNotes", "special_notes")
+
+        required_values = {
+            "email": email,
+            "phone": phone,
+            "source": source,
+            "classificationType": classification_type,
+            "borrowerType": borrower_type,
+            "objective": objective,
+            "loanType": loan_type,
+            "purpose": purpose,
+            "transactionType": transaction_type,
+            "anticipatedSettlementDate": anticipated_settlement_date,
+        }
+
+        missing_required_fields = [
+            REQUIRED_INTAKE_FIELDS[field_name]
+            for field_name, field_value in required_values.items()
+            if not field_value
+        ]
+
+        if missing_required_fields:
             return add_cors(func.HttpResponse(
                 json.dumps({
                     "success": False,
-                    "message": "No file uploaded."
+                    "message": "Missing required fields.",
+                    "missingFields": missing_required_fields,
                 }),
                 status_code=400,
                 mimetype="application/json"
             ))
 
-        existing_unique_id = form.get("uniqueId", "").strip()
-        first_name = form.get("firstName", "").strip()
-        middle_name = form.get("middleName", "").strip()
-        last_name = form.get("lastName", "").strip()
-        email = form.get("email", "").strip()
-        phone = form.get("phone", "").strip()
-        lead_type = form.get("leadType", "business_owner").strip().lower()
-        document_type = form.get("documentType", "").strip()
+        referrer_first_name = get_form_value(form, "referrerFirstName", "ReferrerFirstName", "referrer_first_name")
+        referrer_middle_name = get_form_value(form, "referrerMiddleName", "ReferrerMiddleName", "referrer_middle_name")
+        referrer_last_name = get_form_value(form, "referrerLastName", "ReferrerLastName", "referrer_last_name")
+        referrer_phone = get_form_value(form, "referrerPhone", "ReferrerPhone", "referrer_phone")
+        referrer_email = get_form_value(form, "referrerEmail", "ReferrerEmail", "referrer_email")
+
+        if source.lower() == "direct-client":
+            referrer_first_name = ""
+            referrer_middle_name = ""
+            referrer_last_name = ""
+            referrer_phone = ""
+            referrer_email = ""
 
         conn = get_sql_connection()
         cursor = conn.cursor()
@@ -409,6 +913,76 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
             last_name = last_name or existing_client.LastName or ""
             email = email or existing_client.Email or ""
 
+            cursor.execute("""
+                UPDATE Clients
+                SET
+                    FirstName = ?,
+                    MiddleName = ?,
+                    LastName = ?,
+                    Email = ?,
+                    Phone = ?,
+                    LeadType = ?,
+                    Source = ?,
+                    ClassificationType = ?,
+                    BorrowerType = ?,
+                    Objective = ?,
+                    LoanType = ?,
+                    Purpose = ?,
+                    TransactionType = ?,
+                    WithBorrowersGuarantors = ?,
+                    AnticipatedSettlementDate = ?,
+                    VedaIssues = ?,
+                    ConductIssues = ?,
+                    ClientNeedsObjectives = ?,
+                    ApplicantBackground = ?,
+                    ExplanationOfIncome = ?,
+                    Security = ?,
+                    LoanAmount = ?,
+                    SecurityValue = ?,
+                    Lvr = ?,
+                    SpecialNotes = ?,
+                    Status = ?,
+                    ReferrerFirstName = ?,
+                    ReferrerMiddleName = ?,
+                    ReferrerLastName = ?,
+                    ReferrerPhone = ?,
+                    ReferrerEmail = ?
+                WHERE Id = ?
+            """, (
+                first_name,
+                middle_name,
+                last_name,
+                email,
+                phone,
+                lead_type,
+                source,
+                classification_type,
+                borrower_type,
+                objective,
+                loan_type,
+                purpose,
+                transaction_type,
+                with_borrowers_guarantors,
+                anticipated_settlement_date,
+                veda_issues,
+                conduct_issues,
+                client_needs_objectives,
+                applicant_background,
+                explanation_of_income,
+                security,
+                loan_amount,
+                security_value,
+                lvr,
+                special_notes,
+                "Pending Team Call",
+                referrer_first_name,
+                referrer_middle_name,
+                referrer_last_name,
+                referrer_phone,
+                referrer_email,
+                client_id,
+            ))
+
         else:
             unique_id = f"CL-{uuid.uuid4().hex[:8].upper()}"
 
@@ -419,69 +993,124 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
                     MiddleName,
                     LastName,
                     Email,
+                    Phone,
+                    LeadType,
+                    Source,
+                    ClassificationType,
+                    BorrowerType,
+                    Objective,
+                    LoanType,
+                    Purpose,
+                    TransactionType,
+                    WithBorrowersGuarantors,
+                    AnticipatedSettlementDate,
+                    VedaIssues,
+                    ConductIssues,
+                    ClientNeedsObjectives,
+                    ApplicantBackground,
+                    ExplanationOfIncome,
+                    Security,
+                    LoanAmount,
+                    SecurityValue,
+                    Lvr,
+                    SpecialNotes,
+                    Status,
+                    ReferrerFirstName,
+                    ReferrerMiddleName,
+                    ReferrerLastName,
+                    ReferrerPhone,
+                    ReferrerEmail,
                     DocumentType,
                     FileName,
                     FileUrl
                 )
                 OUTPUT INSERTED.Id
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 unique_id,
                 first_name,
                 middle_name,
                 last_name,
                 email,
+                phone,
+                lead_type,
+                source,
+                classification_type,
+                borrower_type,
+                objective,
+                loan_type,
+                purpose,
+                transaction_type,
+                with_borrowers_guarantors,
+                anticipated_settlement_date,
+                veda_issues,
+                conduct_issues,
+                client_needs_objectives,
+                applicant_background,
+                explanation_of_income,
+                security,
+                loan_amount,
+                security_value,
+                lvr,
+                special_notes,
+                "Pending Team Call",
+                referrer_first_name,
+                referrer_middle_name,
+                referrer_last_name,
+                referrer_phone,
+                referrer_email,
                 document_type,
-                uploaded_file.filename,
-                ""
+                uploaded_filename,
+                blob_url,
             ))
 
             client_id = cursor.fetchone()[0]
 
-        storage_connection_string = os.getenv("STORAGE_CONNECTION_STRING")
-        container_name = os.getenv("BLOB_CONTAINER_NAME", "client-files")
+        if uploaded_file:
+            storage_connection_string = os.getenv("STORAGE_CONNECTION_STRING")
+            container_name = os.getenv("BLOB_CONTAINER_NAME", "client-files")
 
-        blob_service = BlobServiceClient.from_connection_string(
-            storage_connection_string
-        )
-        container_client = blob_service.get_container_client(container_name)
-
-        safe_filename = uploaded_file.filename.replace(" ", "_")
-        blob_name = f"{unique_id}/{uuid.uuid4().hex}-{safe_filename}"
-
-        blob_client = container_client.get_blob_client(blob_name)
-        blob_client.upload_blob(uploaded_file.stream.read(), overwrite=True)
-
-        blob_url = blob_client.url
-
-        cursor.execute("""
-            INSERT INTO Documents (
-                ClientId,
-                DocumentType,
-                FileName,
-                BlobUrl
+            blob_service = BlobServiceClient.from_connection_string(
+                storage_connection_string
             )
-            VALUES (?, ?, ?, ?)
-        """, (
-            client_id,
-            document_type,
-            uploaded_file.filename,
-            blob_url
-        ))
+            container_client = blob_service.get_container_client(container_name)
 
-        cursor.execute("""
-            UPDATE Clients
-            SET
-                DocumentType = ?,
-                FileName = ?,
-                FileUrl = ?
-            WHERE Id = ?
-        """, (
-            document_type,
-            uploaded_file.filename,
-            blob_url,
-            client_id
-        ))
+            safe_filename = uploaded_filename.replace(" ", "_")
+            blob_name = f"{unique_id}/{uuid.uuid4().hex}-{safe_filename}"
+
+            blob_client = container_client.get_blob_client(blob_name)
+            blob_client.upload_blob(uploaded_file.stream.read(), overwrite=True)
+
+            blob_url = blob_client.url
+
+            cursor.execute("""
+                INSERT INTO Documents (
+                    ClientId,
+                    DocumentType,
+                    FileName,
+                    BlobUrl
+                )
+                VALUES (?, ?, ?, ?)
+            """, (
+                client_id,
+                document_type,
+                uploaded_filename,
+                blob_url
+            ))
+
+            cursor.execute("""
+                UPDATE Clients
+                SET
+                    DocumentType = ?,
+                    FileName = ?,
+                    FileUrl = ?
+                WHERE Id = ?
+            """, (
+                document_type,
+                uploaded_filename,
+                blob_url,
+                client_id
+            ))
 
         document_status = get_client_document_status(cursor, client_id)
 
@@ -497,19 +1126,88 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
             email=email,
             phone=phone,
             lead_type=lead_type,
+            source=source,
+            classification_type=classification_type,
+            borrower_type=borrower_type,
+            objective=objective,
+            loan_type=loan_type,
+            purpose=purpose,
+            transaction_type=transaction_type,
+            with_borrowers_guarantors=with_borrowers_guarantors,
+            anticipated_settlement_date=anticipated_settlement_date,
+            referrer_first_name=referrer_first_name,
+            referrer_middle_name=referrer_middle_name,
+            referrer_last_name=referrer_last_name,
+            referrer_phone=referrer_phone,
+            referrer_email=referrer_email,
             uploaded_documents=document_status["uploadedDocuments"],
             missing_documents=document_status["missingDocuments"],
         )
 
+        try:
+            ghl_contact_id = extract_ghl_contact_id(ghl_sync)
+            ghl_location_id = os.getenv("GHL_LOCATION_ID", "").strip()
+
+            conn = get_sql_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE Clients
+                SET
+                    GHLContactId = COALESCE(NULLIF(?, ''), GHLContactId),
+                    GHLLocationId = COALESCE(NULLIF(?, ''), GHLLocationId),
+                    CreatedInGHL = ?,
+                    Status = ?
+                WHERE Id = ?
+            """, (
+                ghl_contact_id,
+                ghl_location_id,
+                bool(ghl_sync.get("success")) if isinstance(ghl_sync, dict) else False,
+                "Pending Team Call",
+                client_id,
+            ))
+            conn.commit()
+            cursor.close()
+            conn.close()
+        except Exception:
+            logging.exception("Failed to update GHL sync metadata on client record.")
+
         return add_cors(func.HttpResponse(
             json.dumps({
                 "success": True,
-                "message": "Client document uploaded successfully.",
+                "message": "Client application submitted successfully.",
                 "clientId": client_id,
                 "uniqueId": unique_id,
                 "blobUrl": blob_url,
                 "leadType": format_lead_type(lead_type),
+                "source": format_lead_type(source),
                 "status": "Pending Team Call",
+                "intake": {
+                    "classificationType": classification_type,
+                    "borrowerType": borrower_type,
+                    "objective": objective,
+                    "loanType": loan_type,
+                    "purpose": purpose,
+                    "transactionType": transaction_type,
+                    "withBorrowersGuarantors": with_borrowers_guarantors,
+                    "anticipatedSettlementDate": anticipated_settlement_date,
+                    "vedaIssues": veda_issues,
+                    "conductIssues": conduct_issues,
+                    "clientNeedsObjectives": client_needs_objectives,
+                    "applicantBackground": applicant_background,
+                    "explanationOfIncome": explanation_of_income,
+                    "security": security,
+                    "loanAmount": loan_amount,
+                    "securityValue": security_value,
+                    "lvr": lvr,
+                    "specialNotes": special_notes,
+                    "referrer": {
+                        "firstName": referrer_first_name,
+                        "middleName": referrer_middle_name,
+                        "lastName": referrer_last_name,
+                        "phone": referrer_phone,
+                        "email": referrer_email,
+                    },
+                },
                 "documentStatus": {
                     "uploadedDocuments": [
                         format_document_type(item)
@@ -637,13 +1335,40 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
                 c.MiddleName,
                 c.LastName,
                 c.Email,
+                c.Phone,
+                c.LeadType,
+                c.Source,
+                c.ClassificationType,
+                c.BorrowerType,
+                c.Objective,
+                c.LoanType,
+                c.Purpose,
+                c.TransactionType,
+                c.WithBorrowersGuarantors,
+                c.AnticipatedSettlementDate,
+                c.VedaIssues,
+                c.ConductIssues,
+                c.ClientNeedsObjectives,
+                c.ApplicantBackground,
+                c.ExplanationOfIncome,
+                c.Security,
+                c.LoanAmount,
+                c.SecurityValue,
+                c.Lvr,
+                c.SpecialNotes,
+                c.Status,
+                c.ReferrerFirstName,
+                c.ReferrerMiddleName,
+                c.ReferrerLastName,
+                c.ReferrerPhone,
+                c.ReferrerEmail,
                 d.Id AS DocumentId,
                 d.DocumentType,
                 d.FileName,
                 d.BlobUrl,
                 d.UploadedAt
             FROM Clients c
-            INNER JOIN Documents d ON d.ClientId = c.Id
+            LEFT JOIN Documents d ON d.ClientId = c.Id
             WHERE 1 = 1
         """
 
@@ -665,14 +1390,38 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
                     OR c.MiddleName LIKE ?
                     OR c.LastName LIKE ?
                     OR c.Email LIKE ?
+                    OR c.Phone LIKE ?
+                    OR c.Source LIKE ?
+                    OR c.ClassificationType LIKE ?
+                    OR c.BorrowerType LIKE ?
+                    OR c.Objective LIKE ?
+                    OR c.LoanType LIKE ?
+                    OR c.Purpose LIKE ?
+                    OR c.TransactionType LIKE ?
+                    OR c.VedaIssues LIKE ?
+                    OR c.ConductIssues LIKE ?
+                    OR c.ClientNeedsObjectives LIKE ?
+                    OR c.ApplicantBackground LIKE ?
+                    OR c.ExplanationOfIncome LIKE ?
+                    OR c.Security LIKE ?
+                    OR CAST(c.LoanAmount AS NVARCHAR(50)) LIKE ?
+                    OR CAST(c.SecurityValue AS NVARCHAR(50)) LIKE ?
+                    OR CAST(c.Lvr AS NVARCHAR(50)) LIKE ?
+                    OR c.SpecialNotes LIKE ?
                     OR d.FileName LIKE ?
                     OR d.DocumentType LIKE ?
                 )
             """
             like = f"%{search}%"
-            params.extend([like, like, like, like, like, like, like])
+            params.extend([
+                like, like, like, like, like,
+                like, like, like, like, like,
+                like, like, like, like, like,
+                like, like, like, like, like,
+                like, like, like, like, like,
+            ])
 
-        query += " ORDER BY d.UploadedAt DESC"
+        query += " ORDER BY COALESCE(d.UploadedAt, '1900-01-01') DESC, c.Id DESC"
 
         cursor.execute(query, params)
         rows = cursor.fetchall()
@@ -681,7 +1430,7 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
 
         for row in rows:
             clients.append({
-                "id": row.DocumentId,
+                "id": row.DocumentId or row.ClientId,
                 "clientId": row.ClientId,
                 "uniqueId": row.UniqueId,
                 "firstName": row.FirstName,
@@ -693,10 +1442,39 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
                     row.LastName
                 ])),
                 "email": row.Email,
+                "phone": row.Phone,
+                "leadType": format_lead_type(row.LeadType),
+                "source": format_lead_type(row.Source),
+                "classificationType": row.ClassificationType,
+                "borrowerType": row.BorrowerType,
+                "objective": row.Objective,
+                "loanType": row.LoanType,
+                "purpose": row.Purpose,
+                "transactionType": row.TransactionType,
+                "withBorrowersGuarantors": row.WithBorrowersGuarantors,
+                "anticipatedSettlementDate": str(row.AnticipatedSettlementDate) if row.AnticipatedSettlementDate else None,
+                "vedaIssues": row.VedaIssues,
+                "conductIssues": row.ConductIssues,
+                "clientNeedsObjectives": row.ClientNeedsObjectives,
+                "applicantBackground": row.ApplicantBackground,
+                "explanationOfIncome": row.ExplanationOfIncome,
+                "security": row.Security,
+                "loanAmount": str(row.LoanAmount) if row.LoanAmount is not None else None,
+                "securityValue": str(row.SecurityValue) if row.SecurityValue is not None else None,
+                "lvr": str(row.Lvr) if row.Lvr is not None else None,
+                "specialNotes": row.SpecialNotes,
+                "status": row.Status,
+                "referrer": {
+                    "firstName": row.ReferrerFirstName,
+                    "middleName": row.ReferrerMiddleName,
+                    "lastName": row.ReferrerLastName,
+                    "phone": row.ReferrerPhone,
+                    "email": row.ReferrerEmail,
+                },
                 "documentType": row.DocumentType,
                 "fileName": row.FileName,
                 "fileUrl": row.BlobUrl,
-                "submittedAt": str(row.UploadedAt),
+                "submittedAt": str(row.UploadedAt) if row.UploadedAt else None,
             })
 
         cursor.close()
@@ -754,7 +1532,33 @@ def client_login(req: func.HttpRequest) -> func.HttpResponse:
                 FirstName,
                 MiddleName,
                 LastName,
-                Email
+                Email,
+                Phone,
+                LeadType,
+                Source,
+                ClassificationType,
+                BorrowerType,
+                Objective,
+                LoanType,
+                Purpose,
+                TransactionType,
+                WithBorrowersGuarantors,
+                AnticipatedSettlementDate,
+                VedaIssues,
+                ConductIssues,
+                ClientNeedsObjectives,
+                ApplicantBackground,
+                ExplanationOfIncome,
+                Security,
+                LoanAmount,
+                SecurityValue,
+                Lvr,
+                SpecialNotes,
+                ReferrerFirstName,
+                ReferrerMiddleName,
+                ReferrerLastName,
+                ReferrerPhone,
+                ReferrerEmail
             FROM Clients
             WHERE UniqueId = ?
             AND LOWER(LastName) = LOWER(?)
@@ -789,6 +1593,34 @@ def client_login(req: func.HttpRequest) -> func.HttpResponse:
                     "middleName": client.MiddleName,
                     "lastName": client.LastName,
                     "email": client.Email,
+                    "phone": client.Phone,
+                    "leadType": format_lead_type(client.LeadType),
+                    "source": format_lead_type(client.Source),
+                    "classificationType": client.ClassificationType,
+                    "borrowerType": client.BorrowerType,
+                    "objective": client.Objective,
+                    "loanType": client.LoanType,
+                    "purpose": client.Purpose,
+                    "transactionType": client.TransactionType,
+                    "withBorrowersGuarantors": client.WithBorrowersGuarantors,
+                    "anticipatedSettlementDate": str(client.AnticipatedSettlementDate) if client.AnticipatedSettlementDate else None,
+                    "vedaIssues": client.VedaIssues,
+                    "conductIssues": client.ConductIssues,
+                    "clientNeedsObjectives": client.ClientNeedsObjectives,
+                    "applicantBackground": client.ApplicantBackground,
+                    "explanationOfIncome": client.ExplanationOfIncome,
+                    "security": client.Security,
+                    "loanAmount": str(client.LoanAmount) if client.LoanAmount is not None else None,
+                    "securityValue": str(client.SecurityValue) if client.SecurityValue is not None else None,
+                    "lvr": str(client.Lvr) if client.Lvr is not None else None,
+                    "specialNotes": client.SpecialNotes,
+                    "referrer": {
+                        "firstName": client.ReferrerFirstName,
+                        "middleName": client.ReferrerMiddleName,
+                        "lastName": client.ReferrerLastName,
+                        "phone": client.ReferrerPhone,
+                        "email": client.ReferrerEmail,
+                    },
                     "name": " ".join(filter(None, [
                         client.FirstName,
                         client.MiddleName,
