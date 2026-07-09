@@ -89,7 +89,7 @@ LEAD_TYPE_LABELS = {
 
 def add_cors(response: func.HttpResponse) -> func.HttpResponse:
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
 
@@ -181,7 +181,9 @@ def format_lead_type(lead_type: str) -> str:
 
 def get_client_document_status(cursor, client_id: int):
     cursor.execute("""
-        SELECT DISTINCT DocumentType
+        SELECT
+            DocumentType,
+            COALESCE(Status, 'Pending') AS Status
         FROM Documents
         WHERE ClientId = ?
     """, client_id)
@@ -194,7 +196,14 @@ def get_client_document_status(cursor, client_id: int):
         if row.DocumentType
     ]
 
+    verified_raw = [
+        (row.DocumentType or "").strip().lower()
+        for row in rows
+        if row.DocumentType and (row.Status or "").strip().lower() == "verified"
+    ]
+
     uploaded_documents = sorted(set(uploaded_raw))
+    verified_documents = sorted(set(verified_raw))
 
     missing_documents = [
         document_type
@@ -202,11 +211,46 @@ def get_client_document_status(cursor, client_id: int):
         if document_type not in uploaded_documents
     ]
 
+    unverified_documents = [
+        document_type
+        for document_type in REQUIRED_DOCUMENTS
+        if document_type in uploaded_documents and document_type not in verified_documents
+    ]
+
+    progress = round((len(verified_documents) / len(REQUIRED_DOCUMENTS)) * 100) if REQUIRED_DOCUMENTS else 0
+    is_complete = len(missing_documents) == 0 and len(unverified_documents) == 0
+
     return {
         "uploadedDocuments": uploaded_documents,
+        "verifiedDocuments": verified_documents,
         "missingDocuments": missing_documents,
-        "isComplete": len(missing_documents) == 0,
+        "unverifiedDocuments": unverified_documents,
+        "isComplete": is_complete,
+        "progress": progress,
+        "documentStatus": "Complete" if is_complete else "Incomplete",
     }
+
+
+def update_client_workflow_status(cursor, client_id: int):
+    status_info = get_client_document_status(cursor, client_id)
+    completed_date_value = datetime.utcnow() if status_info["isComplete"] else None
+
+    cursor.execute("""
+        UPDATE Clients
+        SET
+            Progress = ?,
+            CompletedDate = CASE WHEN ? = 1 THEN COALESCE(CompletedDate, ?) ELSE NULL END,
+            Status = CASE WHEN ? = 1 THEN 'Documents Complete' ELSE COALESCE(Status, 'Pending Team Call') END
+        WHERE Id = ?
+    """, (
+        status_info["progress"],
+        1 if status_info["isComplete"] else 0,
+        completed_date_value,
+        1 if status_info["isComplete"] else 0,
+        client_id,
+    ))
+
+    return status_info
 
 
 def get_ghl_headers():
@@ -1083,19 +1127,69 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
 
             blob_url = blob_client.url
 
+            # Re-upload flow:
+            # If the client uploads a new file for the same document type after rejection,
+            # remove the old rejected document row so the portal shows only the new Pending file.
+            cursor.execute("""
+                SELECT
+                    Id,
+                    BlobUrl
+                FROM Documents
+                WHERE ClientId = ?
+                  AND LOWER(DocumentType) = LOWER(?)
+                  AND LOWER(COALESCE(Status, 'Pending')) IN ('rejected', 'declined', 'failed')
+            """, (
+                client_id,
+                document_type,
+            ))
+
+            rejected_documents = cursor.fetchall()
+
+            for rejected_document in rejected_documents:
+                rejected_blob_url = rejected_document.BlobUrl
+
+                if rejected_blob_url:
+                    try:
+                        parsed_rejected_url = urlparse(rejected_blob_url)
+                        rejected_path_parts = parsed_rejected_url.path.lstrip("/").split("/", 1)
+
+                        if len(rejected_path_parts) == 2:
+                            rejected_blob_name = unquote(rejected_path_parts[1])
+                            container_client.delete_blob(rejected_blob_name)
+                    except Exception:
+                        logging.exception(
+                            "Failed to delete old rejected blob for document %s.",
+                            rejected_document.Id,
+                        )
+
+            cursor.execute("""
+                DELETE FROM Documents
+                WHERE ClientId = ?
+                  AND LOWER(DocumentType) = LOWER(?)
+                  AND LOWER(COALESCE(Status, 'Pending')) IN ('rejected', 'declined', 'failed')
+            """, (
+                client_id,
+                document_type,
+            ))
+
             cursor.execute("""
                 INSERT INTO Documents (
                     ClientId,
                     DocumentType,
                     FileName,
-                    BlobUrl
+                    BlobUrl,
+                    Status,
+                    VerifiedBy,
+                    VerifiedDate,
+                    Remarks
                 )
-                VALUES (?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL)
             """, (
                 client_id,
                 document_type,
                 uploaded_filename,
-                blob_url
+                blob_url,
+                "Pending",
             ))
 
             cursor.execute("""
@@ -1112,7 +1206,7 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
                 client_id
             ))
 
-        document_status = get_client_document_status(cursor, client_id)
+        document_status = update_client_workflow_status(cursor, client_id)
 
         conn.commit()
         cursor.close()
@@ -1235,6 +1329,298 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         ))
+
+
+@app.route(route="documents", auth_level=func.AuthLevel.ANONYMOUS, methods=["GET", "OPTIONS"])
+def get_documents(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    try:
+        client_id = req.params.get("clientId")
+        unique_id = req.params.get("uniqueId")
+        status = req.params.get("status")
+
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+
+        query = """
+            SELECT
+                d.Id,
+                d.ClientId,
+                c.UniqueId,
+                c.FirstName,
+                c.MiddleName,
+                c.LastName,
+                c.Email,
+                d.DocumentType,
+                d.FileName,
+                d.BlobUrl,
+                d.UploadedAt,
+                COALESCE(d.Status, 'Pending') AS Status,
+                d.VerifiedBy,
+                d.VerifiedDate,
+                d.Remarks
+            FROM Documents d
+            INNER JOIN Clients c ON c.Id = d.ClientId
+            WHERE 1 = 1
+        """
+
+        params = []
+
+        if client_id:
+            query += " AND d.ClientId = ?"
+            params.append(client_id)
+
+        if unique_id:
+            query += " AND c.UniqueId = ?"
+            params.append(unique_id)
+
+        if status:
+            query += " AND COALESCE(d.Status, 'Pending') = ?"
+            params.append(status)
+
+        query += " ORDER BY d.UploadedAt DESC, d.Id DESC"
+
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+
+        documents = []
+        for row in rows:
+            documents.append({
+                "id": row.Id,
+                "clientId": row.ClientId,
+                "uniqueId": row.UniqueId,
+                "clientName": " ".join(filter(None, [
+                    row.FirstName,
+                    row.MiddleName,
+                    row.LastName,
+                ])),
+                "email": row.Email,
+                "documentType": row.DocumentType,
+                "documentLabel": format_document_type(row.DocumentType),
+                "fileName": row.FileName,
+                "fileUrl": row.BlobUrl,
+                "uploadedAt": str(row.UploadedAt) if row.UploadedAt else None,
+                "status": row.Status,
+                "verifiedBy": row.VerifiedBy,
+                "verifiedDate": str(row.VerifiedDate) if row.VerifiedDate else None,
+                "remarks": row.Remarks,
+            })
+
+        cursor.close()
+        conn.close()
+
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": True,
+                "documents": documents,
+            }),
+            status_code=200,
+            mimetype="application/json"
+        ))
+
+    except Exception as e:
+        logging.exception("Fetch documents failed.")
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": False,
+                "message": str(e),
+            }),
+            status_code=500,
+            mimetype="application/json"
+        ))
+
+
+def update_document_review_status(document_id, new_status, req: func.HttpRequest):
+    try:
+        data = {}
+        try:
+            data = req.get_json()
+        except Exception:
+            data = {}
+
+        verified_by = clean_value(data.get("verifiedBy") or data.get("adminName") or "Admin")
+        remarks = clean_value(data.get("remarks"))
+
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT
+                d.Id,
+                d.ClientId,
+                d.DocumentType,
+                d.FileName,
+                c.UniqueId,
+                c.FirstName,
+                c.MiddleName,
+                c.LastName,
+                c.Email,
+                c.Phone,
+                c.LeadType,
+                c.Source,
+                c.ClassificationType,
+                c.BorrowerType,
+                c.Objective,
+                c.LoanType,
+                c.Purpose,
+                c.TransactionType,
+                c.WithBorrowersGuarantors,
+                c.AnticipatedSettlementDate,
+                c.ReferrerFirstName,
+                c.ReferrerMiddleName,
+                c.ReferrerLastName,
+                c.ReferrerPhone,
+                c.ReferrerEmail
+            FROM Documents d
+            INNER JOIN Clients c ON c.Id = d.ClientId
+            WHERE d.Id = ?
+        """, document_id)
+
+        row = cursor.fetchone()
+
+        if not row:
+            cursor.close()
+            conn.close()
+
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "Document not found.",
+                }),
+                status_code=404,
+                mimetype="application/json"
+            ))
+
+        verified_date = datetime.utcnow() if new_status == "Verified" else None
+
+        cursor.execute("""
+            UPDATE Documents
+            SET
+                Status = ?,
+                VerifiedBy = ?,
+                VerifiedDate = ?,
+                Remarks = ?
+            WHERE Id = ?
+        """, (
+            new_status,
+            verified_by,
+            verified_date,
+            remarks,
+            document_id,
+        ))
+
+        document_status = update_client_workflow_status(cursor, row.ClientId)
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        try:
+            sync_client_to_ghl(
+                unique_id=row.UniqueId,
+                first_name=row.FirstName,
+                middle_name=row.MiddleName,
+                last_name=row.LastName,
+                email=row.Email,
+                phone=row.Phone,
+                lead_type=row.LeadType,
+                source=row.Source,
+                classification_type=row.ClassificationType,
+                borrower_type=row.BorrowerType,
+                objective=row.Objective,
+                loan_type=row.LoanType,
+                purpose=row.Purpose,
+                transaction_type=row.TransactionType,
+                with_borrowers_guarantors=row.WithBorrowersGuarantors,
+                anticipated_settlement_date=str(row.AnticipatedSettlementDate) if row.AnticipatedSettlementDate else "",
+                referrer_first_name=row.ReferrerFirstName,
+                referrer_middle_name=row.ReferrerMiddleName,
+                referrer_last_name=row.ReferrerLastName,
+                referrer_phone=row.ReferrerPhone,
+                referrer_email=row.ReferrerEmail,
+                uploaded_documents=document_status["uploadedDocuments"],
+                missing_documents=document_status["missingDocuments"],
+            )
+        except Exception:
+            logging.exception("GHL sync after document review failed.")
+
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": True,
+                "message": f"Document marked as {new_status}.",
+                "document": {
+                    "id": row.Id,
+                    "clientId": row.ClientId,
+                    "uniqueId": row.UniqueId,
+                    "documentType": row.DocumentType,
+                    "documentLabel": format_document_type(row.DocumentType),
+                    "fileName": row.FileName,
+                    "status": new_status,
+                    "verifiedBy": verified_by,
+                    "verifiedDate": verified_date.isoformat() if verified_date else None,
+                    "remarks": remarks,
+                },
+                "documentStatus": {
+                    "uploadedDocuments": [
+                        format_document_type(item)
+                        for item in document_status["uploadedDocuments"]
+                    ],
+                    "verifiedDocuments": [
+                        format_document_type(item)
+                        for item in document_status["verifiedDocuments"]
+                    ],
+                    "missingDocuments": [
+                        format_document_type(item)
+                        for item in document_status["missingDocuments"]
+                    ],
+                    "unverifiedDocuments": [
+                        format_document_type(item)
+                        for item in document_status["unverifiedDocuments"]
+                    ],
+                    "isComplete": document_status["isComplete"],
+                    "progress": document_status["progress"],
+                },
+            }),
+            status_code=200,
+            mimetype="application/json"
+        ))
+
+    except Exception as e:
+        logging.exception("Update document review status failed.")
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": False,
+                "message": str(e),
+            }),
+            status_code=500,
+            mimetype="application/json"
+        ))
+
+
+@app.route(route="documents/{document_id}/verify", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST", "PUT", "OPTIONS"])
+def verify_document(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    return update_document_review_status(req.route_params.get("document_id"), "Verified", req)
+
+
+@app.route(route="documents/{document_id}/reject", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST", "PUT", "OPTIONS"])
+def reject_document(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    return update_document_review_status(req.route_params.get("document_id"), "Rejected", req)
+
+
+@app.route(route="documents/{document_id}/pending", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST", "PUT", "OPTIONS"])
+def pending_document(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    return update_document_review_status(req.route_params.get("document_id"), "Pending", req)
 
 
 @app.route(route="file-url", auth_level=func.AuthLevel.ANONYMOUS, methods=["GET", "OPTIONS"])
@@ -1366,7 +1752,16 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
                 d.DocumentType,
                 d.FileName,
                 d.BlobUrl,
-                d.UploadedAt
+                d.UploadedAt,
+                COALESCE(d.Status, 'Pending') AS DocumentStatus,
+                d.VerifiedBy,
+                d.VerifiedDate,
+                d.Remarks,
+                c.Progress,
+                c.CompletedDate,
+                c.ReminderSent,
+                c.LastReminderDate,
+                c.AssignedSpecialist
             FROM Clients c
             LEFT JOIN Documents d ON d.ClientId = c.Id
             WHERE 1 = 1
@@ -1475,6 +1870,15 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
                 "fileName": row.FileName,
                 "fileUrl": row.BlobUrl,
                 "submittedAt": str(row.UploadedAt) if row.UploadedAt else None,
+                "documentStatus": row.DocumentStatus,
+                "verifiedBy": row.VerifiedBy,
+                "verifiedDate": str(row.VerifiedDate) if row.VerifiedDate else None,
+                "remarks": row.Remarks,
+                "progress": row.Progress,
+                "completedDate": str(row.CompletedDate) if row.CompletedDate else None,
+                "reminderSent": bool(row.ReminderSent) if row.ReminderSent is not None else False,
+                "lastReminderDate": str(row.LastReminderDate) if row.LastReminderDate else None,
+                "assignedSpecialist": row.AssignedSpecialist,
             })
 
         cursor.close()
@@ -1558,7 +1962,12 @@ def client_login(req: func.HttpRequest) -> func.HttpResponse:
                 ReferrerMiddleName,
                 ReferrerLastName,
                 ReferrerPhone,
-                ReferrerEmail
+                ReferrerEmail,
+                Progress,
+                CompletedDate,
+                ReminderSent,
+                LastReminderDate,
+                AssignedSpecialist
             FROM Clients
             WHERE UniqueId = ?
             AND LOWER(LastName) = LOWER(?)
@@ -1621,6 +2030,11 @@ def client_login(req: func.HttpRequest) -> func.HttpResponse:
                         "phone": client.ReferrerPhone,
                         "email": client.ReferrerEmail,
                     },
+                    "progress": client.Progress,
+                    "completedDate": str(client.CompletedDate) if client.CompletedDate else None,
+                    "reminderSent": bool(client.ReminderSent) if client.ReminderSent is not None else False,
+                    "lastReminderDate": str(client.LastReminderDate) if client.LastReminderDate else None,
+                    "assignedSpecialist": client.AssignedSpecialist,
                     "name": " ".join(filter(None, [
                         client.FirstName,
                         client.MiddleName,
