@@ -28,6 +28,11 @@ GHL_CLIENT_SUBMISSION_TAG = os.getenv(
     "client-submission-received",
 ).strip() or "client-submission-received"
 
+GHL_CLIENT_SUBMISSION_WORKFLOW_ID = os.getenv(
+    "GHL_CLIENT_SUBMISSION_WORKFLOW_ID",
+    "",
+).strip()
+
 GHL_PASSWORD_CHANGED_TAG = os.getenv(
     "GHL_PASSWORD_CHANGED_TAG",
     "client-password-changed",
@@ -474,6 +479,98 @@ def remove_ghl_tags(contact_id: str, tags: list[str]) -> dict:
             "statusCode": 500,
             "message": str(exc),
         }
+
+
+def remove_contact_from_ghl_workflow(
+    contact_id: str,
+    workflow_id: str,
+) -> dict:
+    contact_id = clean_value(contact_id)
+    workflow_id = clean_value(workflow_id)
+
+    if not contact_id:
+        return {
+            "success": False,
+            "skipped": True,
+            "message": "Missing GHL contact ID.",
+        }
+
+    if not workflow_id:
+        return {
+            "success": False,
+            "skipped": True,
+            "message": "Missing GHL workflow ID.",
+        }
+
+    ghl_api_base = os.getenv(
+        "GHL_API_BASE",
+        "https://services.leadconnectorhq.com",
+    ).rstrip("/")
+
+    try:
+        response = requests.delete(
+            f"{ghl_api_base}/contacts/{contact_id}/workflow/{workflow_id}",
+            headers=get_ghl_headers(),
+            timeout=30,
+        )
+
+        logging.info(
+            "GHL remove contact from workflow response: %s %s",
+            response.status_code,
+            response.text[:1000],
+        )
+
+        try:
+            body = response.json()
+        except ValueError:
+            body = response.text
+
+        return {
+            "success": response.status_code in [200, 201, 204],
+            "statusCode": response.status_code,
+            "body": body,
+        }
+
+    except requests.RequestException as exc:
+        logging.exception("Failed to remove contact from GHL workflow.")
+        return {
+            "success": False,
+            "statusCode": 500,
+            "message": str(exc),
+        }
+
+
+def retrigger_submission_workflow(contact_id: str) -> dict:
+    workflow_removal = {
+        "success": False,
+        "skipped": True,
+        "message": "GHL_CLIENT_SUBMISSION_WORKFLOW_ID is not configured.",
+    }
+
+    if GHL_CLIENT_SUBMISSION_WORKFLOW_ID:
+        workflow_removal = remove_contact_from_ghl_workflow(
+            contact_id,
+            GHL_CLIENT_SUBMISSION_WORKFLOW_ID,
+        )
+
+        logging.info(
+            "Submission workflow removal result: %s",
+            json.dumps(workflow_removal, default=str)[:1500],
+        )
+
+        time.sleep(1)
+
+    tag_trigger = retrigger_ghl_tag(
+        contact_id,
+        GHL_CLIENT_SUBMISSION_TAG,
+    )
+
+    return {
+        "success": bool(tag_trigger.get("success")),
+        "workflowId": GHL_CLIENT_SUBMISSION_WORKFLOW_ID or None,
+        "workflowRemoval": workflow_removal,
+        "tagTrigger": tag_trigger,
+    }
 
 
 def retrigger_ghl_tag(contact_id: str, tag: str) -> dict:
@@ -1484,7 +1581,7 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
         ghl_submission_trigger = {
             "success": False,
             "skipped": True,
-            "message": "Not an initial submission or GHL contact was not resolved.",
+            "message": "Not an initial submission, GHL sync failed, or GHL contact was not resolved.",
         }
 
         if (
@@ -1493,9 +1590,8 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
             and ghl_sync.get("success")
             and ghl_contact_id
         ):
-            ghl_submission_trigger = add_ghl_tags(
+            ghl_submission_trigger = retrigger_submission_workflow(
                 ghl_contact_id,
-                [GHL_CLIENT_SUBMISSION_TAG],
             )
 
         try:
