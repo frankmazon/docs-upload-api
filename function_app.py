@@ -6,6 +6,11 @@ import uuid
 import pyodbc
 import requests
 import re
+import base64
+import hashlib
+import hmac
+import secrets
+import time
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, unquote
 from azure.storage.blob import (
@@ -17,6 +22,20 @@ from azure.storage.blob import (
 app = func.FunctionApp()
 
 _GHL_FIELD_MAP_CACHE = None
+
+GHL_CLIENT_SUBMISSION_TAG = os.getenv(
+    "GHL_CLIENT_SUBMISSION_TAG",
+    "client-submission-received",
+).strip() or "client-submission-received"
+
+GHL_PASSWORD_CHANGED_TAG = os.getenv(
+    "GHL_PASSWORD_CHANGED_TAG",
+    "client-password-changed",
+).strip() or "client-password-changed"
+
+PASSWORD_HASH_ITERATIONS = int(
+    os.getenv("PASSWORD_HASH_ITERATIONS", "310000")
+)
 
 REQUIRED_DOCUMENTS = [
     "id",
@@ -110,6 +129,71 @@ def get_sql_connection():
 
 def clean_value(value):
     return (value or "").strip()
+
+
+def hash_client_password(password: str) -> str:
+    if not password:
+        raise ValueError("Password cannot be empty.")
+
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        PASSWORD_HASH_ITERATIONS,
+    )
+
+    return "pbkdf2_sha256${iterations}${salt}${digest}".format(
+        iterations=PASSWORD_HASH_ITERATIONS,
+        salt=base64.urlsafe_b64encode(salt).decode("ascii"),
+        digest=base64.urlsafe_b64encode(digest).decode("ascii"),
+    )
+
+
+def verify_client_password(password: str, stored_hash: str) -> bool:
+    try:
+        algorithm, iterations_text, salt_text, digest_text = stored_hash.split("$", 3)
+
+        if algorithm != "pbkdf2_sha256":
+            return False
+
+        iterations = int(iterations_text)
+        salt = base64.urlsafe_b64decode(salt_text.encode("ascii"))
+        expected_digest = base64.urlsafe_b64decode(digest_text.encode("ascii"))
+
+        actual_digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            (password or "").encode("utf-8"),
+            salt,
+            iterations,
+        )
+
+        return hmac.compare_digest(actual_digest, expected_digest)
+
+    except (ValueError, TypeError):
+        logging.warning("Invalid client password hash format.")
+        return False
+
+
+def validate_new_password(password: str) -> list[str]:
+    errors = []
+
+    if len(password or "") < 8:
+        errors.append("Password must contain at least 8 characters.")
+
+    if not re.search(r"[A-Z]", password or ""):
+        errors.append("Password must contain at least one uppercase letter.")
+
+    if not re.search(r"[a-z]", password or ""):
+        errors.append("Password must contain at least one lowercase letter.")
+
+    if not re.search(r"\d", password or ""):
+        errors.append("Password must contain at least one number.")
+
+    if not re.search(r"[^A-Za-z0-9]", password or ""):
+        errors.append("Password must contain at least one special character.")
+
+    return errors
 
 
 def none_if_empty(value):
@@ -256,10 +340,160 @@ def update_client_workflow_status(cursor, client_id: int):
 def get_ghl_headers():
     token = os.getenv("GHL_ACCESS_TOKEN", "").strip()
 
+    if not token:
+        raise ValueError("GHL_ACCESS_TOKEN is not configured.")
+
+    authorization = (
+        token
+        if token.lower().startswith("bearer ")
+        else f"Bearer {token}"
+    )
+
     return {
-        "Authorization": f"Bearer {token}",
+        "Authorization": authorization,
+        "Accept": "application/json",
         "Version": "2021-07-28",
         "Content-Type": "application/json",
+    }
+
+
+def add_ghl_tags(contact_id: str, tags: list[str]) -> dict:
+    contact_id = clean_value(contact_id)
+    clean_tags = list(dict.fromkeys(
+        clean_value(tag) for tag in tags if clean_value(tag)
+    ))
+
+    if not contact_id:
+        return {
+            "success": False,
+            "skipped": True,
+            "message": "Missing GHL contact ID.",
+        }
+
+    if not clean_tags:
+        return {
+            "success": False,
+            "skipped": True,
+            "message": "No GHL tags supplied.",
+        }
+
+    ghl_api_base = os.getenv(
+        "GHL_API_BASE",
+        "https://services.leadconnectorhq.com",
+    ).rstrip("/")
+
+    try:
+        response = requests.post(
+            f"{ghl_api_base}/contacts/{contact_id}/tags",
+            headers=get_ghl_headers(),
+            json={"tags": clean_tags},
+            timeout=30,
+        )
+
+        logging.info(
+            "GHL add tags response: %s %s",
+            response.status_code,
+            response.text[:1000],
+        )
+
+        try:
+            body = response.json()
+        except ValueError:
+            body = response.text
+
+        return {
+            "success": response.status_code in [200, 201],
+            "statusCode": response.status_code,
+            "body": body,
+        }
+
+    except requests.RequestException as exc:
+        logging.exception("Failed to add GHL tags.")
+        return {
+            "success": False,
+            "statusCode": 500,
+            "message": str(exc),
+        }
+
+
+
+def remove_ghl_tags(contact_id: str, tags: list[str]) -> dict:
+    contact_id = clean_value(contact_id)
+    clean_tags = list(dict.fromkeys(
+        clean_value(tag) for tag in tags if clean_value(tag)
+    ))
+
+    if not contact_id:
+        return {
+            "success": False,
+            "skipped": True,
+            "message": "Missing GHL contact ID.",
+        }
+
+    if not clean_tags:
+        return {
+            "success": False,
+            "skipped": True,
+            "message": "No GHL tags supplied.",
+        }
+
+    ghl_api_base = os.getenv(
+        "GHL_API_BASE",
+        "https://services.leadconnectorhq.com",
+    ).rstrip("/")
+
+    try:
+        response = requests.delete(
+            f"{ghl_api_base}/contacts/{contact_id}/tags",
+            headers=get_ghl_headers(),
+            json={"tags": clean_tags},
+            timeout=30,
+        )
+
+        logging.info(
+            "GHL remove tags response: %s %s",
+            response.status_code,
+            response.text[:1000],
+        )
+
+        try:
+            body = response.json()
+        except ValueError:
+            body = response.text
+
+        return {
+            "success": response.status_code in [200, 201, 204],
+            "statusCode": response.status_code,
+            "body": body,
+        }
+
+    except requests.RequestException as exc:
+        logging.exception("Failed to remove GHL tags.")
+        return {
+            "success": False,
+            "statusCode": 500,
+            "message": str(exc),
+        }
+
+
+def retrigger_ghl_tag(contact_id: str, tag: str) -> dict:
+    remove_result = remove_ghl_tags(contact_id, [tag])
+
+    logging.info(
+        "GHL password tag removal result: %s",
+        json.dumps(remove_result, default=str)[:1500],
+    )
+
+    # Give HighLevel a brief moment to persist the tag removal before re-adding it.
+    time.sleep(1)
+
+    add_result = add_ghl_tags(contact_id, [tag])
+
+    return {
+        "success": bool(add_result.get("success")),
+        "tag": tag,
+        "remove": remove_result,
+        "add": add_result,
     }
 
 
@@ -816,6 +1050,8 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
         uploaded_file = files.get("file")
 
         existing_unique_id = clean_value(form.get("uniqueId"))
+        is_initial_submission = not bool(existing_unique_id)
+
         first_name = clean_value(form.get("firstName"))
         middle_name = clean_value(form.get("middleName"))
         last_name = clean_value(form.get("lastName"))
@@ -1064,12 +1300,15 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
                     ReferrerLastName,
                     ReferrerPhone,
                     ReferrerEmail,
+                    PasswordHash,
+                    MustChangePassword,
+                    PasswordChangedDate,
                     DocumentType,
                     FileName,
                     FileUrl
                 )
                 OUTPUT INSERTED.Id
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 unique_id,
                 first_name,
@@ -1103,6 +1342,9 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
                 referrer_last_name,
                 referrer_phone,
                 referrer_email,
+                None,
+                1,
+                None,
                 document_type,
                 uploaded_filename,
                 blob_url,
@@ -1238,8 +1480,25 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
             missing_documents=document_status["missingDocuments"],
         )
 
+        ghl_contact_id = extract_ghl_contact_id(ghl_sync)
+        ghl_submission_trigger = {
+            "success": False,
+            "skipped": True,
+            "message": "Not an initial submission or GHL contact was not resolved.",
+        }
+
+        if (
+            is_initial_submission
+            and isinstance(ghl_sync, dict)
+            and ghl_sync.get("success")
+            and ghl_contact_id
+        ):
+            ghl_submission_trigger = add_ghl_tags(
+                ghl_contact_id,
+                [GHL_CLIENT_SUBMISSION_TAG],
+            )
+
         try:
-            ghl_contact_id = extract_ghl_contact_id(ghl_sync)
             ghl_location_id = os.getenv("GHL_LOCATION_ID", "").strip()
 
             conn = get_sql_connection()
@@ -1314,6 +1573,7 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
                     "isComplete": document_status["isComplete"],
                 },
                 "ghlSync": ghl_sync,
+                "ghlSubmissionTrigger": ghl_submission_trigger,
             }),
             status_code=200,
             mimetype="application/json"
@@ -1905,25 +2165,237 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
         ))
 
 
-@app.route(route="client-login", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST", "OPTIONS"])
-def client_login(req: func.HttpRequest) -> func.HttpResponse:
+@app.route(
+    route="client-change-password",
+    auth_level=func.AuthLevel.ANONYMOUS,
+    methods=["POST", "OPTIONS"],
+)
+def client_change_password(req: func.HttpRequest) -> func.HttpResponse:
     if req.method == "OPTIONS":
         return add_cors(func.HttpResponse("", status_code=204))
+
+    conn = None
+    cursor = None
 
     try:
         data = req.get_json()
 
-        unique_id = data.get("uniqueId", "").strip()
-        password = data.get("password", "").strip()
+        unique_id = clean_value(data.get("uniqueId"))
+        current_password = data.get("currentPassword") or ""
+        new_password = data.get("newPassword") or ""
+
+        if not unique_id or not current_password or not new_password:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": (
+                        "Client ID, current password, and new password are required."
+                    ),
+                }),
+                status_code=400,
+                mimetype="application/json",
+            ))
+
+        password_errors = validate_new_password(new_password)
+
+        if password_errors:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": password_errors[0],
+                    "errors": password_errors,
+                }),
+                status_code=400,
+                mimetype="application/json",
+            ))
+
+        if hmac.compare_digest(current_password, new_password):
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": (
+                        "Your new password must be different from your current password."
+                    ),
+                }),
+                status_code=400,
+                mimetype="application/json",
+            ))
+
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT TOP 1
+                Id,
+                UniqueId,
+                FirstName,
+                LastName,
+                Email,
+                PasswordHash,
+                COALESCE(MustChangePassword, 1) AS MustChangePassword,
+                GHLContactId
+            FROM Clients
+            WHERE UniqueId = ?
+        """, unique_id)
+
+        client = cursor.fetchone()
+
+        if not client:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "Client account was not found.",
+                }),
+                status_code=404,
+                mimetype="application/json",
+            ))
+
+        stored_hash = clean_value(client.PasswordHash)
+
+        if stored_hash:
+            current_password_valid = verify_client_password(
+                current_password,
+                stored_hash,
+            )
+        else:
+            current_password_valid = hmac.compare_digest(
+                current_password.casefold(),
+                clean_value(client.LastName).casefold(),
+            )
+
+        if not current_password_valid:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "The current password is incorrect.",
+                }),
+                status_code=401,
+                mimetype="application/json",
+            ))
+
+        password_hash = hash_client_password(new_password)
+        changed_at = datetime.utcnow()
+
+        cursor.execute("""
+            UPDATE Clients
+            SET
+                PasswordHash = ?,
+                MustChangePassword = 0,
+                PasswordChangedDate = ?
+            WHERE Id = ?
+        """, (
+            password_hash,
+            changed_at,
+            client.Id,
+        ))
+
+        conn.commit()
+
+        ghl_contact_id = clean_value(client.GHLContactId)
+
+        if ghl_contact_id:
+            email_notification = retrigger_ghl_tag(
+                ghl_contact_id,
+                GHL_PASSWORD_CHANGED_TAG,
+            )
+        else:
+            email_notification = {
+                "success": False,
+                "skipped": True,
+                "message": "GHL contact ID is not available.",
+            }
+
+        logging.info(
+            "Password changed for client %s. GHL result: %s",
+            client.UniqueId,
+            json.dumps(email_notification, default=str)[:1500],
+        )
+
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": True,
+                "message": "Password changed successfully.",
+                "mustChangePassword": False,
+                "passwordChangedDate": changed_at.isoformat() + "Z",
+                "emailNotificationSent": bool(
+                    isinstance(email_notification, dict)
+                    and email_notification.get("success")
+                ),
+                "emailNotification": email_notification,
+                "emailTriggerTag": GHL_PASSWORD_CHANGED_TAG,
+            }),
+            status_code=200,
+            mimetype="application/json",
+        ))
+
+    except ValueError:
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": False,
+                "message": "A valid JSON request body is required.",
+            }),
+            status_code=400,
+            mimetype="application/json",
+        ))
+
+    except Exception as exc:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        logging.exception("Client password change failed.")
+
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": False,
+                "message": str(exc),
+            }),
+            status_code=500,
+            mimetype="application/json",
+        ))
+
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+@app.route(
+    route="client-login",
+    auth_level=func.AuthLevel.ANONYMOUS,
+    methods=["POST", "OPTIONS"],
+)
+def client_login(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    conn = None
+    cursor = None
+
+    try:
+        data = req.get_json()
+
+        unique_id = clean_value(data.get("uniqueId"))
+        password = data.get("password") or ""
 
         if not unique_id or not password:
             return add_cors(func.HttpResponse(
                 json.dumps({
                     "success": False,
-                    "message": "Client ID and password are required."
+                    "message": "Client ID and password are required.",
                 }),
                 status_code=400,
-                mimetype="application/json"
+                mimetype="application/json",
             ))
 
         conn = get_sql_connection()
@@ -1967,92 +2439,167 @@ def client_login(req: func.HttpRequest) -> func.HttpResponse:
                 CompletedDate,
                 ReminderSent,
                 LastReminderDate,
-                AssignedSpecialist
+                AssignedSpecialist,
+                PasswordHash,
+                COALESCE(MustChangePassword, 1) AS MustChangePassword,
+                PasswordChangedDate
             FROM Clients
             WHERE UniqueId = ?
-            AND LOWER(LastName) = LOWER(?)
-        """, (
-            unique_id,
-            password
-        ))
+        """, unique_id)
 
         client = cursor.fetchone()
-
-        cursor.close()
-        conn.close()
 
         if not client:
             return add_cors(func.HttpResponse(
                 json.dumps({
                     "success": False,
-                    "message": "Invalid Client ID or password."
+                    "message": "Invalid Client ID or password.",
                 }),
                 status_code=401,
-                mimetype="application/json"
+                mimetype="application/json",
             ))
+
+        stored_hash = clean_value(client.PasswordHash)
+
+        if stored_hash:
+            password_valid = verify_client_password(password, stored_hash)
+            must_change_password = bool(client.MustChangePassword)
+        else:
+            password_valid = hmac.compare_digest(
+                password.casefold(),
+                clean_value(client.LastName).casefold(),
+            )
+            must_change_password = True
+
+        if not password_valid:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "Invalid Client ID or password.",
+                }),
+                status_code=401,
+                mimetype="application/json",
+            ))
+
+        client_payload = {
+            "id": client.Id,
+            "uniqueId": client.UniqueId,
+            "firstName": client.FirstName,
+            "middleName": client.MiddleName,
+            "lastName": client.LastName,
+            "email": client.Email,
+            "phone": client.Phone,
+            "leadType": format_lead_type(client.LeadType),
+            "source": format_lead_type(client.Source),
+            "classificationType": client.ClassificationType,
+            "borrowerType": client.BorrowerType,
+            "objective": client.Objective,
+            "loanType": client.LoanType,
+            "purpose": client.Purpose,
+            "transactionType": client.TransactionType,
+            "withBorrowersGuarantors": client.WithBorrowersGuarantors,
+            "anticipatedSettlementDate": (
+                str(client.AnticipatedSettlementDate)
+                if client.AnticipatedSettlementDate
+                else None
+            ),
+            "vedaIssues": client.VedaIssues,
+            "conductIssues": client.ConductIssues,
+            "clientNeedsObjectives": client.ClientNeedsObjectives,
+            "applicantBackground": client.ApplicantBackground,
+            "explanationOfIncome": client.ExplanationOfIncome,
+            "security": client.Security,
+            "loanAmount": (
+                str(client.LoanAmount)
+                if client.LoanAmount is not None
+                else None
+            ),
+            "securityValue": (
+                str(client.SecurityValue)
+                if client.SecurityValue is not None
+                else None
+            ),
+            "lvr": str(client.Lvr) if client.Lvr is not None else None,
+            "specialNotes": client.SpecialNotes,
+            "referrer": {
+                "firstName": client.ReferrerFirstName,
+                "middleName": client.ReferrerMiddleName,
+                "lastName": client.ReferrerLastName,
+                "phone": client.ReferrerPhone,
+                "email": client.ReferrerEmail,
+            },
+            "progress": client.Progress,
+            "completedDate": (
+                str(client.CompletedDate)
+                if client.CompletedDate
+                else None
+            ),
+            "reminderSent": (
+                bool(client.ReminderSent)
+                if client.ReminderSent is not None
+                else False
+            ),
+            "lastReminderDate": (
+                str(client.LastReminderDate)
+                if client.LastReminderDate
+                else None
+            ),
+            "assignedSpecialist": client.AssignedSpecialist,
+            "mustChangePassword": must_change_password,
+            "passwordChangedDate": (
+                str(client.PasswordChangedDate)
+                if client.PasswordChangedDate
+                else None
+            ),
+            "name": " ".join(filter(None, [
+                client.FirstName,
+                client.MiddleName,
+                client.LastName,
+            ])),
+        }
 
         return add_cors(func.HttpResponse(
             json.dumps({
                 "success": True,
                 "message": "Client login successful.",
-                "client": {
-                    "id": client.Id,
-                    "uniqueId": client.UniqueId,
-                    "firstName": client.FirstName,
-                    "middleName": client.MiddleName,
-                    "lastName": client.LastName,
-                    "email": client.Email,
-                    "phone": client.Phone,
-                    "leadType": format_lead_type(client.LeadType),
-                    "source": format_lead_type(client.Source),
-                    "classificationType": client.ClassificationType,
-                    "borrowerType": client.BorrowerType,
-                    "objective": client.Objective,
-                    "loanType": client.LoanType,
-                    "purpose": client.Purpose,
-                    "transactionType": client.TransactionType,
-                    "withBorrowersGuarantors": client.WithBorrowersGuarantors,
-                    "anticipatedSettlementDate": str(client.AnticipatedSettlementDate) if client.AnticipatedSettlementDate else None,
-                    "vedaIssues": client.VedaIssues,
-                    "conductIssues": client.ConductIssues,
-                    "clientNeedsObjectives": client.ClientNeedsObjectives,
-                    "applicantBackground": client.ApplicantBackground,
-                    "explanationOfIncome": client.ExplanationOfIncome,
-                    "security": client.Security,
-                    "loanAmount": str(client.LoanAmount) if client.LoanAmount is not None else None,
-                    "securityValue": str(client.SecurityValue) if client.SecurityValue is not None else None,
-                    "lvr": str(client.Lvr) if client.Lvr is not None else None,
-                    "specialNotes": client.SpecialNotes,
-                    "referrer": {
-                        "firstName": client.ReferrerFirstName,
-                        "middleName": client.ReferrerMiddleName,
-                        "lastName": client.ReferrerLastName,
-                        "phone": client.ReferrerPhone,
-                        "email": client.ReferrerEmail,
-                    },
-                    "progress": client.Progress,
-                    "completedDate": str(client.CompletedDate) if client.CompletedDate else None,
-                    "reminderSent": bool(client.ReminderSent) if client.ReminderSent is not None else False,
-                    "lastReminderDate": str(client.LastReminderDate) if client.LastReminderDate else None,
-                    "assignedSpecialist": client.AssignedSpecialist,
-                    "name": " ".join(filter(None, [
-                        client.FirstName,
-                        client.MiddleName,
-                        client.LastName
-                    ]))
-                }
+                "mustChangePassword": must_change_password,
+                "client": client_payload,
             }),
             status_code=200,
-            mimetype="application/json"
+            mimetype="application/json",
         ))
 
-    except Exception as e:
-        logging.exception("Client login failed.")
+    except ValueError:
         return add_cors(func.HttpResponse(
             json.dumps({
                 "success": False,
-                "message": str(e)
+                "message": "A valid JSON request body is required.",
+            }),
+            status_code=400,
+            mimetype="application/json",
+        ))
+
+    except Exception as exc:
+        logging.exception("Client login failed.")
+
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": False,
+                "message": str(exc),
             }),
             status_code=500,
-            mimetype="application/json"
+            mimetype="application/json",
         ))
+
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
