@@ -113,7 +113,7 @@ LEAD_TYPE_LABELS = {
 
 def add_cors(response: func.HttpResponse) -> func.HttpResponse:
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
 
@@ -507,17 +507,21 @@ def remove_contact_from_ghl_workflow(
         "https://services.leadconnectorhq.com",
     ).rstrip("/")
 
+    url = f"{ghl_api_base}/contacts/{contact_id}/workflow/{workflow_id}"
+
     try:
         response = requests.delete(
-            f"{ghl_api_base}/contacts/{contact_id}/workflow/{workflow_id}",
+            url,
             headers=get_ghl_headers(),
             timeout=30,
         )
 
         logging.info(
-            "GHL remove contact from workflow response: %s %s",
+            "GHL remove workflow | contact=%s workflow=%s status=%s body=%s",
+            contact_id,
+            workflow_id,
             response.status_code,
-            response.text[:1000],
+            response.text[:2000],
         )
 
         try:
@@ -529,6 +533,8 @@ def remove_contact_from_ghl_workflow(
             "success": response.status_code in [200, 201, 204],
             "statusCode": response.status_code,
             "body": body,
+            "contactId": contact_id,
+            "workflowId": workflow_id,
         }
 
     except requests.RequestException as exc:
@@ -537,54 +543,99 @@ def remove_contact_from_ghl_workflow(
             "success": False,
             "statusCode": 500,
             "message": str(exc),
+            "contactId": contact_id,
+            "workflowId": workflow_id,
         }
 
 
-def retrigger_submission_workflow(contact_id: str) -> dict:
-    workflow_removal = {
-        "success": False,
-        "skipped": True,
-        "message": "GHL_CLIENT_SUBMISSION_WORKFLOW_ID is not configured.",
-    }
+def add_contact_to_ghl_workflow(
+    contact_id: str,
+    workflow_id: str,
+) -> dict:
+    contact_id = clean_value(contact_id)
+    workflow_id = clean_value(workflow_id)
 
-    if GHL_CLIENT_SUBMISSION_WORKFLOW_ID:
-        workflow_removal = remove_contact_from_ghl_workflow(
-            contact_id,
-            GHL_CLIENT_SUBMISSION_WORKFLOW_ID,
+    if not contact_id:
+        return {
+            "success": False,
+            "skipped": True,
+            "message": "Missing GHL contact ID.",
+        }
+
+    if not workflow_id:
+        return {
+            "success": False,
+            "skipped": True,
+            "message": "Missing GHL workflow ID.",
+        }
+
+    ghl_api_base = os.getenv(
+        "GHL_API_BASE",
+        "https://services.leadconnectorhq.com",
+    ).rstrip("/")
+
+    url = f"{ghl_api_base}/contacts/{contact_id}/workflow/{workflow_id}"
+
+    try:
+        response = requests.post(
+            url,
+            headers=get_ghl_headers(),
+            json={},
+            timeout=30,
         )
 
         logging.info(
-            "Submission workflow removal result: %s",
-            json.dumps(workflow_removal, default=str)[:1500],
+            "GHL add workflow | contact=%s workflow=%s status=%s body=%s",
+            contact_id,
+            workflow_id,
+            response.status_code,
+            response.text[:2000],
         )
 
-        time.sleep(1)
+        try:
+            body = response.json()
+        except ValueError:
+            body = response.text
 
-    tag_trigger = retrigger_ghl_tag(
-        contact_id,
-        GHL_CLIENT_SUBMISSION_TAG,
-    )
+        return {
+            "success": response.status_code in [200, 201, 204],
+            "statusCode": response.status_code,
+            "body": body,
+            "contactId": contact_id,
+            "workflowId": workflow_id,
+        }
 
-    return {
-        "success": bool(tag_trigger.get("success")),
-        "workflowId": GHL_CLIENT_SUBMISSION_WORKFLOW_ID or None,
-        "workflowRemoval": workflow_removal,
-        "tagTrigger": tag_trigger,
-    }
+    except requests.RequestException as exc:
+        logging.exception("Failed to add contact to GHL workflow.")
+        return {
+            "success": False,
+            "statusCode": 500,
+            "message": str(exc),
+            "contactId": contact_id,
+            "workflowId": workflow_id,
+        }
 
 
 def retrigger_ghl_tag(contact_id: str, tag: str) -> dict:
     remove_result = remove_ghl_tags(contact_id, [tag])
 
     logging.info(
-        "GHL password tag removal result: %s",
-        json.dumps(remove_result, default=str)[:1500],
+        "GHL tag removal | contact=%s tag=%s result=%s",
+        contact_id,
+        tag,
+        json.dumps(remove_result, default=str)[:2000],
     )
 
-    # Give HighLevel a brief moment to persist the tag removal before re-adding it.
-    time.sleep(1)
+    time.sleep(2)
 
     add_result = add_ghl_tags(contact_id, [tag])
+
+    logging.info(
+        "GHL tag addition | contact=%s tag=%s result=%s",
+        contact_id,
+        tag,
+        json.dumps(add_result, default=str)[:2000],
+    )
 
     return {
         "success": bool(add_result.get("success")),
@@ -592,6 +643,100 @@ def retrigger_ghl_tag(contact_id: str, tag: str) -> dict:
         "remove": remove_result,
         "add": add_result,
     }
+
+
+def start_submission_workflow(contact_id: str) -> dict:
+    """
+    Start the submission workflow directly through the HighLevel workflow API.
+
+    Direct enrollment avoids relying only on a tag event. If the contact is
+    already active, the old execution is removed and enrollment is retried.
+    """
+    contact_id = clean_value(contact_id)
+
+    if not contact_id:
+        return {
+            "success": False,
+            "skipped": True,
+            "message": "Missing GHL contact ID.",
+        }
+
+    if not GHL_CLIENT_SUBMISSION_WORKFLOW_ID:
+        logging.warning(
+            "GHL_CLIENT_SUBMISSION_WORKFLOW_ID is missing; using tag trigger fallback."
+        )
+        fallback = retrigger_ghl_tag(
+            contact_id,
+            GHL_CLIENT_SUBMISSION_TAG,
+        )
+        return {
+            "success": bool(fallback.get("success")),
+            "mode": "tag-fallback",
+            "workflowId": None,
+            "tagTrigger": fallback,
+        }
+
+    workflow_id = GHL_CLIENT_SUBMISSION_WORKFLOW_ID
+
+    removal_result = remove_contact_from_ghl_workflow(
+        contact_id,
+        workflow_id,
+    )
+
+    logging.info(
+        "Submission workflow removal result: %s",
+        json.dumps(removal_result, default=str)[:3000],
+    )
+
+    time.sleep(3)
+
+    attempts = []
+    retry_delays = [0, 3, 5, 8]
+
+    for attempt_number, delay_seconds in enumerate(retry_delays, start=1):
+        if delay_seconds:
+            time.sleep(delay_seconds)
+
+        add_result = add_contact_to_ghl_workflow(
+            contact_id,
+            workflow_id,
+        )
+        attempts.append(add_result)
+
+        logging.info(
+            "Submission workflow enrollment attempt %s: %s",
+            attempt_number,
+            json.dumps(add_result, default=str)[:3000],
+        )
+
+        if add_result.get("success"):
+            tag_result = add_ghl_tags(
+                contact_id,
+                [GHL_CLIENT_SUBMISSION_TAG],
+            )
+
+            return {
+                "success": True,
+                "mode": "direct-workflow",
+                "workflowId": workflow_id,
+                "workflowRemoval": removal_result,
+                "workflowEnrollment": add_result,
+                "attempts": attempts,
+                "reportingTag": tag_result,
+            }
+
+        if add_result.get("statusCode") not in [400, 409, 422]:
+            break
+
+    return {
+        "success": False,
+        "mode": "direct-workflow",
+        "workflowId": workflow_id,
+        "message": "HighLevel did not enroll the contact in the submission workflow.",
+        "workflowRemoval": removal_result,
+        "attempts": attempts,
+    }
+
 
 
 def normalize_ghl_key(value):
@@ -1590,7 +1735,7 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
             and ghl_sync.get("success")
             and ghl_contact_id
         ):
-            ghl_submission_trigger = retrigger_submission_workflow(
+            ghl_submission_trigger = start_submission_workflow(
                 ghl_contact_id,
             )
 
