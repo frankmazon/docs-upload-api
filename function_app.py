@@ -42,20 +42,34 @@ PASSWORD_HASH_ITERATIONS = int(
     os.getenv("PASSWORD_HASH_ITERATIONS", "310000")
 )
 
-REQUIRED_DOCUMENTS = [
-    "id",
-    "property-documents",
-    "credit-history",
-    "income-documents",
-    "other",
-]
+TRANSACTION_DOCUMENTS = {
+    "alt_doc": [
+        "bas-from-ato-portal",
+        "business-banking-statements",
+        "last-6-months-mortgage-statements",
+        "council-rates-notice",
+    ],
+    "full_doc": [
+        "payslip",
+        "management-reports-financial-statements",
+        "group-certificate-payment-summary",
+        "company-tax-returns",
+        "individual-tax-returns",
+        "last-6-months-mortgage-statements",
+        "council-rates-notice",
+    ],
+}
 
 DOCUMENT_LABELS = {
-    "id": "ID",
-    "property-documents": "Property Documents",
-    "credit-history": "Credit History",
-    "income-documents": "Income Documents",
-    "other": "Other",
+    "bas-from-ato-portal": "BAS from ATO Portal",
+    "business-banking-statements": "Business Banking Statements",
+    "payslip": "Payslip",
+    "management-reports-financial-statements": "Management Reports / Financial Statements",
+    "group-certificate-payment-summary": "Group Certificate / Payment Summary",
+    "company-tax-returns": "Company Tax Returns",
+    "individual-tax-returns": "Individual Tax Returns",
+    "last-6-months-mortgage-statements": "Last 6 Months Mortgage Statements",
+    "council-rates-notice": "Council Rates Notice",
 }
 
 
@@ -63,6 +77,11 @@ GHL_CUSTOM_FIELD_CONFIG = {
     "GHL_CUSTOM_FIELD_CLIENT_ID": ["client_id", "unique_id"],
     "GHL_CUSTOM_FIELD_DOCUMENT_STATUS": ["document_status"],
     "GHL_CUSTOM_FIELD_MISSING_DOCUMENTS": ["missing_documents"],
+    "GHL_CUSTOM_FIELD_REQUIRED_DOCUMENTS": [
+        "required_documents",
+        "required_document_list",
+        "documents_required",
+    ],
     "GHL_APPLICATION_SOURCE_FIELD": ["application_source"],
     "GHL_CLASSIFICATION_FIELD": ["classification_type"],
     "GHL_BORROWER_FIELD": ["borrower_type"],
@@ -255,6 +274,43 @@ def extract_ghl_contact_id(ghl_sync):
     return ""
 
 
+def normalize_transaction_type(transaction_type: str) -> str:
+    normalized = re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        clean_value(transaction_type).lower(),
+    ).strip("_")
+
+    aliases = {
+        "alt": "alt_doc",
+        "alt_doc": "alt_doc",
+        "altdoc": "alt_doc",
+        "full": "full_doc",
+        "full_doc": "full_doc",
+        "fulldoc": "full_doc",
+    }
+
+    return aliases.get(normalized, normalized)
+
+
+def get_required_documents(transaction_type: str) -> list[str]:
+    return list(
+        TRANSACTION_DOCUMENTS.get(
+            normalize_transaction_type(transaction_type),
+            [],
+        )
+    )
+
+
+def is_valid_document_type(transaction_type: str, document_type: str) -> bool:
+    clean_document_type = clean_value(document_type).lower()
+
+    if not clean_document_type:
+        return True
+
+    return clean_document_type in get_required_documents(transaction_type)
+
+
 def format_document_type(document_type: str) -> str:
     clean_type = (document_type or "").strip().lower()
     return DOCUMENT_LABELS.get(
@@ -263,12 +319,51 @@ def format_document_type(document_type: str) -> str:
     )
 
 
+def get_required_document_types(transaction_type: str) -> list[str]:
+    normalized_transaction_type = normalize_ghl_key(transaction_type)
+
+    if normalized_transaction_type not in TRANSACTION_DOCUMENTS:
+        return []
+
+    return list(TRANSACTION_DOCUMENTS[normalized_transaction_type])
+
+
+def get_required_document_labels(transaction_type: str) -> list[str]:
+    return [
+        format_document_type(document_type)
+        for document_type in get_required_document_types(transaction_type)
+    ]
+
+
+def format_required_documents_for_ghl(transaction_type: str) -> str:
+    labels = get_required_document_labels(transaction_type)
+
+    if not labels:
+        return ""
+
+    return "\n".join(f"• {label}" for label in labels)
+
+
 def format_lead_type(lead_type: str) -> str:
     clean_type = (lead_type or "broker").strip().lower()
     return LEAD_TYPE_LABELS.get(clean_type, clean_type.replace("-", " ").title())
 
 
 def get_client_document_status(cursor, client_id: int):
+    cursor.execute("""
+        SELECT TOP 1 TransactionType
+        FROM Clients
+        WHERE Id = ?
+    """, client_id)
+
+    client_row = cursor.fetchone()
+    transaction_type = (
+        clean_value(client_row.TransactionType)
+        if client_row
+        else ""
+    )
+    required_documents = get_required_documents(transaction_type)
+
     cursor.execute("""
         SELECT
             DocumentType,
@@ -296,20 +391,32 @@ def get_client_document_status(cursor, client_id: int):
 
     missing_documents = [
         document_type
-        for document_type in REQUIRED_DOCUMENTS
+        for document_type in required_documents
         if document_type not in uploaded_documents
     ]
 
     unverified_documents = [
         document_type
-        for document_type in REQUIRED_DOCUMENTS
+        for document_type in required_documents
         if document_type in uploaded_documents and document_type not in verified_documents
     ]
 
-    progress = round((len(verified_documents) / len(REQUIRED_DOCUMENTS)) * 100) if REQUIRED_DOCUMENTS else 0
-    is_complete = len(missing_documents) == 0 and len(unverified_documents) == 0
+    progress = (
+        round((len([
+            item for item in verified_documents if item in required_documents
+        ]) / len(required_documents)) * 100)
+        if required_documents
+        else 0
+    )
+    is_complete = (
+        bool(required_documents)
+        and len(missing_documents) == 0
+        and len(unverified_documents) == 0
+    )
 
     return {
+        "transactionType": transaction_type,
+        "requiredDocuments": required_documents,
         "uploadedDocuments": uploaded_documents,
         "verifiedDocuments": verified_documents,
         "missingDocuments": missing_documents,
@@ -318,6 +425,7 @@ def get_client_document_status(cursor, client_id: int):
         "progress": progress,
         "documentStatus": "Complete" if is_complete else "Incomplete",
     }
+
 
 
 def update_client_workflow_status(cursor, client_id: int):
@@ -944,6 +1052,7 @@ def build_ghl_custom_fields(
     unique_id,
     document_status,
     missing_documents,
+    required_documents,
     source,
     classification_type,
     borrower_type,
@@ -980,6 +1089,13 @@ def build_ghl_custom_fields(
         custom_fields,
         "GHL_CUSTOM_FIELD_MISSING_DOCUMENTS",
         ", ".join(missing_documents),
+        ghl_field_map,
+    )
+
+    add_ghl_field(
+        custom_fields,
+        "GHL_CUSTOM_FIELD_REQUIRED_DOCUMENTS",
+        required_documents,
         ghl_field_map,
     )
 
@@ -1079,6 +1195,11 @@ def sync_client_to_ghl(
             for document_type in missing_documents
         ]
 
+        required_labels = get_required_document_labels(transaction_type)
+        required_documents_text = format_required_documents_for_ghl(
+            transaction_type
+        )
+
         is_complete = len(missing_documents) == 0
         document_status = "Complete" if is_complete else "Incomplete"
         lead_label = format_lead_type(lead_type)
@@ -1120,6 +1241,7 @@ def sync_client_to_ghl(
             unique_id=unique_id,
             document_status=document_status,
             missing_documents=missing_labels,
+            required_documents=required_documents_text,
             source=source_label,
             classification_type=classification_type,
             borrower_type=borrower_type,
@@ -1379,6 +1501,32 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
                     "success": False,
                     "message": "Missing required fields.",
                     "missingFields": missing_required_fields,
+                }),
+                status_code=400,
+                mimetype="application/json"
+            ))
+
+        required_documents = get_required_documents(transaction_type)
+
+        if not required_documents:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "Unsupported transaction type.",
+                    "transactionType": transaction_type,
+                }),
+                status_code=400,
+                mimetype="application/json"
+            ))
+
+        if document_type and not is_valid_document_type(transaction_type, document_type):
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "The selected document type is not valid for this transaction type.",
+                    "transactionType": transaction_type,
+                    "documentType": document_type,
+                    "allowedDocumentTypes": required_documents,
                 }),
                 status_code=400,
                 mimetype="application/json"
@@ -1803,6 +1951,14 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
                     },
                 },
                 "documentStatus": {
+                    "transactionType": transaction_type,
+                    "requiredDocuments": [
+                        format_document_type(item)
+                        for item in document_status["requiredDocuments"]
+                    ],
+                    "requiredDocumentsText": format_required_documents_for_ghl(
+                        transaction_type
+                    ),
                     "uploadedDocuments": [
                         format_document_type(item)
                         for item in document_status["uploadedDocuments"]
@@ -2064,6 +2220,10 @@ def update_document_review_status(document_id, new_status, req: func.HttpRequest
                     "remarks": remarks,
                 },
                 "documentStatus": {
+                    "requiredDocuments": [
+                        format_document_type(item)
+                        for item in document_status["requiredDocuments"]
+                    ],
                     "uploadedDocuments": [
                         format_document_type(item)
                         for item in document_status["uploadedDocuments"]
@@ -2831,7 +2991,7 @@ def client_login(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json",
         ))
-
+ 
     finally:
         if cursor:
             try:
