@@ -46,6 +46,8 @@ TRANSACTION_DOCUMENTS = {
     "alt_doc": [
         "bas-from-ato-portal",
         "business-banking-statements",
+        "id",
+        "passport",
         "last-6-months-mortgage-statements",
         "council-rates-notice",
     ],
@@ -53,6 +55,8 @@ TRANSACTION_DOCUMENTS = {
         "payslip",
         "management-reports-financial-statements",
         "group-certificate-payment-summary",
+        "id",
+        "passport",
         "company-tax-returns",
         "individual-tax-returns",
         "last-6-months-mortgage-statements",
@@ -2284,6 +2288,101 @@ def pending_document(req: func.HttpRequest) -> func.HttpResponse:
     return update_document_review_status(req.route_params.get("document_id"), "Pending", req)
 
 
+
+@app.route(route="file-preview", auth_level=func.AuthLevel.ANONYMOUS, methods=["GET", "OPTIONS"])
+def preview_file(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    try:
+        blob_url = req.params.get("blobUrl")
+
+        if not blob_url:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "blobUrl is required."
+                }),
+                status_code=400,
+                mimetype="application/json",
+            ))
+
+        storage_connection_string = os.getenv("STORAGE_CONNECTION_STRING")
+        configured_container = os.getenv("BLOB_CONTAINER_NAME", "client-files")
+
+        if not storage_connection_string:
+            raise Exception("STORAGE_CONNECTION_STRING is not configured.")
+
+        parsed_url = urlparse(blob_url)
+        path_parts = parsed_url.path.lstrip("/").split("/", 1)
+
+        if len(path_parts) < 2:
+            raise Exception("Invalid blob URL.")
+
+        container_name = unquote(path_parts[0]) or configured_container
+        blob_name = unquote(path_parts[1])
+
+        blob_service = BlobServiceClient.from_connection_string(
+            storage_connection_string
+        )
+        blob_client = blob_service.get_blob_client(
+            container=container_name,
+            blob=blob_name,
+        )
+
+        properties = blob_client.get_blob_properties()
+        content_length = int(properties.size or 0)
+
+        max_preview_size = int(
+            os.getenv("MAX_INLINE_PREVIEW_BYTES", str(25 * 1024 * 1024))
+        )
+
+        if content_length > max_preview_size:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "This file is too large for inline preview. Please download it instead."
+                }),
+                status_code=413,
+                mimetype="application/json",
+            ))
+
+        file_bytes = blob_client.download_blob().readall()
+        file_name = os.path.basename(blob_name) or "document.pdf"
+        content_type = (
+            properties.content_settings.content_type
+            or "application/octet-stream"
+        )
+
+        # PDF previews require an inline disposition and PDF content type.
+        if file_name.lower().endswith(".pdf"):
+            content_type = "application/pdf"
+
+        response = func.HttpResponse(
+            body=file_bytes,
+            status_code=200,
+            mimetype=content_type,
+        )
+        response.headers["Content-Disposition"] = (
+            f'inline; filename="{file_name.replace(chr(34), "")}"'
+        )
+        response.headers["Cache-Control"] = "private, max-age=300"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+
+        return add_cors(response)
+
+    except Exception as exc:
+        logging.exception("Failed to stream file preview.")
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": False,
+                "message": str(exc) or "Failed to preview file."
+            }),
+            status_code=500,
+            mimetype="application/json",
+        ))
+
+
 @app.route(route="file-url", auth_level=func.AuthLevel.ANONYMOUS, methods=["GET", "OPTIONS"])
 def get_file_url(req: func.HttpRequest) -> func.HttpResponse:
     if req.method == "OPTIONS":
@@ -2991,7 +3090,7 @@ def client_login(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json",
         ))
- 
+
     finally:
         if cursor:
             try:
