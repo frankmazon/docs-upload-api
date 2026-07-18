@@ -67,6 +67,8 @@ TRANSACTION_DOCUMENTS = {
 DOCUMENT_LABELS = {
     "bas-from-ato-portal": "BAS from ATO Portal",
     "business-banking-statements": "Business Banking Statements",
+    "id": "ID",
+    "passport": "Passport",
     "payslip": "Payslip",
     "management-reports-financial-statements": "Management Reports / Financial Statements",
     "group-certificate-payment-summary": "Group Certificate / Payment Summary",
@@ -289,12 +291,70 @@ def normalize_transaction_type(transaction_type: str) -> str:
         "alt": "alt_doc",
         "alt_doc": "alt_doc",
         "altdoc": "alt_doc",
+        "alternative_doc": "alt_doc",
+        "alternative_document": "alt_doc",
         "full": "full_doc",
         "full_doc": "full_doc",
         "fulldoc": "full_doc",
+        "full_document": "full_doc",
     }
 
     return aliases.get(normalized, normalized)
+
+
+DOCUMENT_TYPE_ALIASES = {
+    "id": "id",
+    "id_file": "id",
+    "valid_id": "id",
+    "identification": "id",
+    "identity_document": "id",
+    "passport": "passport",
+    "passport_file": "passport",
+    "payslip": "payslip",
+    "payslip_file": "payslip",
+    "pay_slip": "payslip",
+    "bas": "bas-from-ato-portal",
+    "bas_from_ato": "bas-from-ato-portal",
+    "bas_from_ato_portal": "bas-from-ato-portal",
+    "business_banking_statement": "business-banking-statements",
+    "business_banking_statements": "business-banking-statements",
+    "management_report": "management-reports-financial-statements",
+    "management_reports": "management-reports-financial-statements",
+    "financial_statement": "management-reports-financial-statements",
+    "financial_statements": "management-reports-financial-statements",
+    "management_reports_financial_statements": "management-reports-financial-statements",
+    "group_certificate": "group-certificate-payment-summary",
+    "payment_summary": "group-certificate-payment-summary",
+    "group_certificate_payment_summary": "group-certificate-payment-summary",
+    "company_tax_return": "company-tax-returns",
+    "company_tax_returns": "company-tax-returns",
+    "individual_tax_return": "individual-tax-returns",
+    "individual_tax_returns": "individual-tax-returns",
+    "last_6_months_mortgage_statement": "last-6-months-mortgage-statements",
+    "last_6_months_mortgage_statements": "last-6-months-mortgage-statements",
+    "last_six_months_mortgage_statements": "last-6-months-mortgage-statements",
+    "council_rate_notice": "council-rates-notice",
+    "council_rates_notice": "council-rates-notice",
+}
+
+
+def normalize_document_type(document_type: str) -> str:
+    normalized = re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        clean_value(document_type).lower(),
+    ).strip("_")
+
+    if not normalized:
+        return ""
+
+    if normalized.endswith("_file"):
+        normalized = normalized[:-5]
+
+    return DOCUMENT_TYPE_ALIASES.get(
+        normalized,
+        normalized.replace("_", "-"),
+    )
 
 
 def get_required_documents(transaction_type: str) -> list[str]:
@@ -307,16 +367,16 @@ def get_required_documents(transaction_type: str) -> list[str]:
 
 
 def is_valid_document_type(transaction_type: str, document_type: str) -> bool:
-    clean_document_type = clean_value(document_type).lower()
+    normalized_document_type = normalize_document_type(document_type)
 
-    if not clean_document_type:
+    if not normalized_document_type:
         return True
 
-    return clean_document_type in get_required_documents(transaction_type)
+    return normalized_document_type in get_required_documents(transaction_type)
 
 
 def format_document_type(document_type: str) -> str:
-    clean_type = (document_type or "").strip().lower()
+    clean_type = normalize_document_type(document_type)
     return DOCUMENT_LABELS.get(
         clean_type,
         clean_type.replace("-", " ").title() if clean_type else "Document",
@@ -379,13 +439,13 @@ def get_client_document_status(cursor, client_id: int):
     rows = cursor.fetchall()
 
     uploaded_raw = [
-        (row.DocumentType or "").strip().lower()
+        normalize_document_type(row.DocumentType)
         for row in rows
         if row.DocumentType
     ]
 
     verified_raw = [
-        (row.DocumentType or "").strip().lower()
+        normalize_document_type(row.DocumentType)
         for row in rows
         if row.DocumentType and (row.Status or "").strip().lower() == "verified"
     ]
@@ -1429,7 +1489,13 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
         lead_type = clean_value(form.get("leadType") or form.get("source") or "Broker")
         source = clean_value(form.get("source") or lead_type or "Broker")
 
-        document_type = clean_value(form.get("documentType"))
+        raw_document_type = get_form_value(
+            form,
+            "documentType",
+            "DocumentType",
+            "document_type",
+        )
+        document_type = normalize_document_type(raw_document_type)
         uploaded_filename = uploaded_file.filename if uploaded_file else ""
         blob_url = ""
 
@@ -1523,13 +1589,30 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             ))
 
-        if document_type and not is_valid_document_type(transaction_type, document_type):
+        normalized_transaction_type = normalize_transaction_type(transaction_type)
+
+        logging.info(
+            "Upload validation | transaction raw=%s normalized=%s | "
+            "document raw=%s normalized=%s | allowed=%s",
+            transaction_type,
+            normalized_transaction_type,
+            raw_document_type,
+            document_type,
+            required_documents,
+        )
+
+        if document_type and not is_valid_document_type(
+            normalized_transaction_type,
+            document_type,
+        ):
             return add_cors(func.HttpResponse(
                 json.dumps({
                     "success": False,
                     "message": "The selected document type is not valid for this transaction type.",
                     "transactionType": transaction_type,
-                    "documentType": document_type,
+                    "normalizedTransactionType": normalized_transaction_type,
+                    "documentType": raw_document_type,
+                    "normalizedDocumentType": document_type,
                     "allowedDocumentTypes": required_documents,
                 }),
                 status_code=400,
@@ -2530,8 +2613,8 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
         params = []
 
         if document_type:
-            query += " AND d.DocumentType = ?"
-            params.append(document_type)
+            query += " AND LOWER(d.DocumentType) = LOWER(?)"
+            params.append(normalize_document_type(document_type))
 
         if unique_id:
             query += " AND c.UniqueId = ?"
