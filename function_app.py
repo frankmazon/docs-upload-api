@@ -244,6 +244,145 @@ def get_optional_form_value(form, *keys):
     return value if value else None
 
 
+def normalize_co_borrowers(value) -> list[dict]:
+    if value in [None, ""]:
+        return []
+
+    parsed = value
+
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            logging.warning("Invalid co-borrowers JSON payload.")
+            return []
+
+    if isinstance(parsed, dict):
+        parsed = (
+            parsed.get("coBorrowers")
+            or parsed.get("CoBorrowers")
+            or parsed.get("co_borrowers")
+            or parsed.get("additionalCoBorrowers")
+            or []
+        )
+
+    if not isinstance(parsed, list):
+        return []
+
+    normalized = []
+
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+
+        first_name = clean_value(
+            item.get("firstName")
+            or item.get("FirstName")
+            or item.get("first_name")
+        )
+        middle_name = clean_value(
+            item.get("middleName")
+            or item.get("MiddleName")
+            or item.get("middle_name")
+        )
+        last_name = clean_value(
+            item.get("lastName")
+            or item.get("LastName")
+            or item.get("last_name")
+        )
+        phone_country_code = clean_value(
+            item.get("phoneCountryCode")
+            or item.get("PhoneCountryCode")
+            or item.get("phone_country_code")
+        )
+        phone = clean_value(
+            item.get("phone")
+            or item.get("Phone")
+            or item.get("mobile")
+            or item.get("Mobile")
+        )
+        email = clean_value(item.get("email") or item.get("Email"))
+
+        if not any([first_name, last_name, phone, email]):
+            continue
+
+        normalized.append({
+            "firstName": first_name,
+            "middleName": middle_name,
+            "lastName": last_name,
+            "phoneCountryCode": phone_country_code,
+            "phone": phone,
+            "email": email,
+        })
+
+    return normalized
+
+
+def get_client_co_borrowers(cursor, client_id: int) -> list[dict]:
+    if not client_id:
+        return []
+
+    cursor.execute("""
+        SELECT
+            FirstName,
+            MiddleName,
+            LastName,
+            PhoneCountryCode,
+            Phone,
+            Email
+        FROM dbo.ClientCoBorrowers
+        WHERE ClientId = ?
+        ORDER BY SortOrder, Id
+    """, client_id)
+
+    return [
+        {
+            "firstName": clean_value(row.FirstName),
+            "middleName": clean_value(row.MiddleName),
+            "lastName": clean_value(row.LastName),
+            "phoneCountryCode": clean_value(row.PhoneCountryCode),
+            "phone": clean_value(row.Phone),
+            "email": clean_value(row.Email),
+        }
+        for row in cursor.fetchall()
+    ]
+
+
+def replace_client_co_borrowers(
+    cursor,
+    client_id: int,
+    co_borrowers: list[dict],
+) -> None:
+    cursor.execute(
+        "DELETE FROM dbo.ClientCoBorrowers WHERE ClientId = ?",
+        client_id,
+    )
+
+    for sort_order, co_borrower in enumerate(co_borrowers, start=1):
+        cursor.execute("""
+            INSERT INTO dbo.ClientCoBorrowers (
+                ClientId,
+                SortOrder,
+                FirstName,
+                MiddleName,
+                LastName,
+                PhoneCountryCode,
+                Phone,
+                Email
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            client_id,
+            sort_order,
+            co_borrower.get("firstName", ""),
+            co_borrower.get("middleName", ""),
+            co_borrower.get("lastName", ""),
+            co_borrower.get("phoneCountryCode", ""),
+            co_borrower.get("phone", ""),
+            co_borrower.get("email", ""),
+        ))
+
+
 def extract_ghl_contact_id(ghl_sync):
     body = ghl_sync.get("body") if isinstance(ghl_sync, dict) else None
 
@@ -366,6 +505,24 @@ def get_required_documents(transaction_type: str) -> list[str]:
     )
 
 
+def get_client_waived_documents(cursor, client_id: int) -> list[str]:
+    if not client_id:
+        return []
+
+    cursor.execute("""
+        SELECT DocumentType
+        FROM dbo.DocumentWaivers
+        WHERE ClientId = ?
+        ORDER BY WaivedAt ASC, Id ASC
+    """, client_id)
+
+    return sorted({
+        normalize_document_type(row.DocumentType)
+        for row in cursor.fetchall()
+        if clean_value(row.DocumentType)
+    })
+
+
 def is_valid_document_type(transaction_type: str, document_type: str) -> bool:
     normalized_document_type = normalize_document_type(document_type)
 
@@ -427,6 +584,7 @@ def get_client_document_status(cursor, client_id: int):
         else ""
     )
     required_documents = get_required_documents(transaction_type)
+    waived_documents = get_client_waived_documents(cursor, client_id)
 
     cursor.execute("""
         SELECT
@@ -457,17 +615,27 @@ def get_client_document_status(cursor, client_id: int):
         document_type
         for document_type in required_documents
         if document_type not in uploaded_documents
+        and document_type not in waived_documents
     ]
 
     unverified_documents = [
         document_type
         for document_type in required_documents
-        if document_type in uploaded_documents and document_type not in verified_documents
+        if document_type in uploaded_documents
+        and document_type not in verified_documents
+        and document_type not in waived_documents
     ]
+
+    satisfied_documents = sorted({
+        document_type
+        for document_type in required_documents
+        if document_type in verified_documents
+        or document_type in waived_documents
+    })
 
     progress = (
         round((len([
-            item for item in verified_documents if item in required_documents
+            item for item in satisfied_documents if item in required_documents
         ]) / len(required_documents)) * 100)
         if required_documents
         else 0
@@ -483,6 +651,8 @@ def get_client_document_status(cursor, client_id: int):
         "requiredDocuments": required_documents,
         "uploadedDocuments": uploaded_documents,
         "verifiedDocuments": verified_documents,
+        "waivedDocuments": waived_documents,
+        "satisfiedDocuments": satisfied_documents,
         "missingDocuments": missing_documents,
         "unverifiedDocuments": unverified_documents,
         "isComplete": is_complete,
@@ -1513,6 +1683,22 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
             "withBorrowers",
             "WithBorrowers",
         )
+        co_borrower_field_names = (
+            "coBorrowers",
+            "CoBorrowers",
+            "co_borrowers",
+            "coBorrowersJson",
+            "CoBorrowersJson",
+            "additionalCoBorrowers",
+            "AdditionalCoBorrowers",
+            "additional_co_borrowers",
+        )
+        co_borrowers_were_supplied = any(
+            field_name in form for field_name in co_borrower_field_names
+        )
+        co_borrowers = normalize_co_borrowers(
+            get_form_value(form, *co_borrower_field_names)
+        )
         anticipated_settlement_date = get_form_value(
             form,
             "anticipatedSettlementDate",
@@ -1571,6 +1757,21 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
                     "success": False,
                     "message": "Missing required fields.",
                     "missingFields": missing_required_fields,
+                }),
+                status_code=400,
+                mimetype="application/json"
+            ))
+
+        if (
+            is_initial_submission
+            and with_borrowers_guarantors.strip().lower() == "yes"
+            and not co_borrowers
+        ):
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "Add at least one co-borrower before submitting.",
+                    "field": "coBorrowers",
                 }),
                 status_code=400,
                 mimetype="application/json"
@@ -1829,6 +2030,11 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
 
             client_id = cursor.fetchone()[0]
 
+        if co_borrowers_were_supplied:
+            replace_client_co_borrowers(cursor, client_id, co_borrowers)
+        else:
+            co_borrowers = get_client_co_borrowers(cursor, client_id)
+
         if uploaded_file:
             storage_connection_string = os.getenv("STORAGE_CONNECTION_STRING")
             container_name = os.getenv("BLOB_CONTAINER_NAME", "client-files")
@@ -2018,6 +2224,7 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
                     "purpose": purpose,
                     "transactionType": transaction_type,
                     "withBorrowersGuarantors": with_borrowers_guarantors,
+                    "coBorrowers": co_borrowers,
                     "anticipatedSettlementDate": anticipated_settlement_date,
                     "vedaIssues": veda_issues,
                     "conductIssues": conduct_issues,
@@ -2049,6 +2256,10 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
                     "uploadedDocuments": [
                         format_document_type(item)
                         for item in document_status["uploadedDocuments"]
+                    ],
+                    "waivedDocuments": [
+                        format_document_type(item)
+                        for item in document_status["waivedDocuments"]
                     ],
                     "missingDocuments": [
                         format_document_type(item)
@@ -2319,6 +2530,10 @@ def update_document_review_status(document_id, new_status, req: func.HttpRequest
                         format_document_type(item)
                         for item in document_status["verifiedDocuments"]
                     ],
+                    "waivedDocuments": [
+                        format_document_type(item)
+                        for item in document_status["waivedDocuments"]
+                    ],
                     "missingDocuments": [
                         format_document_type(item)
                         for item in document_status["missingDocuments"]
@@ -2369,6 +2584,163 @@ def pending_document(req: func.HttpRequest) -> func.HttpResponse:
         return add_cors(func.HttpResponse("", status_code=204))
 
     return update_document_review_status(req.route_params.get("document_id"), "Pending", req)
+
+
+@app.route(
+    route="clients/{client_id}/documents/{document_type}/waive",
+    auth_level=func.AuthLevel.ANONYMOUS,
+    methods=["POST", "DELETE", "OPTIONS"],
+)
+def waive_client_document(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    conn = None
+    cursor = None
+
+    try:
+        client_id_text = clean_value(req.route_params.get("client_id"))
+        document_type = normalize_document_type(
+            req.route_params.get("document_type")
+        )
+
+        if not client_id_text.isdigit() or not document_type:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "A valid client ID and document type are required.",
+                }),
+                status_code=400,
+                mimetype="application/json",
+            ))
+
+        client_id = int(client_id_text)
+        data = {}
+
+        try:
+            data = req.get_json() or {}
+        except ValueError:
+            data = {}
+
+        waived_by = clean_value(
+            data.get("waivedBy") or data.get("adminName") or "Admin"
+        )
+        remarks = clean_value(data.get("remarks"))
+
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT TOP 1 Id, TransactionType
+            FROM Clients
+            WHERE Id = ?
+        """, client_id)
+        client = cursor.fetchone()
+
+        if not client:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "Client not found.",
+                }),
+                status_code=404,
+                mimetype="application/json",
+            ))
+
+        required_documents = get_required_documents(client.TransactionType)
+
+        if document_type not in required_documents:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "This document is not required for the client.",
+                    "documentType": document_type,
+                }),
+                status_code=400,
+                mimetype="application/json",
+            ))
+
+        if req.method == "DELETE":
+            cursor.execute("""
+                DELETE FROM dbo.DocumentWaivers
+                WHERE ClientId = ? AND DocumentType = ?
+            """, client_id, document_type)
+            action_message = "Document waiver removed."
+        else:
+            cursor.execute("""
+                MERGE dbo.DocumentWaivers AS target
+                USING (
+                    SELECT ? AS ClientId, ? AS DocumentType
+                ) AS source
+                ON target.ClientId = source.ClientId
+                   AND target.DocumentType = source.DocumentType
+                WHEN MATCHED THEN
+                    UPDATE SET
+                        WaivedBy = ?,
+                        Remarks = ?,
+                        WaivedAt = SYSUTCDATETIME()
+                WHEN NOT MATCHED THEN
+                    INSERT (ClientId, DocumentType, WaivedBy, Remarks, WaivedAt)
+                    VALUES (?, ?, ?, ?, SYSUTCDATETIME());
+            """, (
+                client_id,
+                document_type,
+                waived_by,
+                remarks,
+                client_id,
+                document_type,
+                waived_by,
+                remarks,
+            ))
+            action_message = "Document requirement waived."
+
+        document_status = update_client_workflow_status(cursor, client_id)
+        conn.commit()
+
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": True,
+                "message": action_message,
+                "clientId": client_id,
+                "documentType": document_type,
+                "documentLabel": format_document_type(document_type),
+                "waivedBy": waived_by if req.method != "DELETE" else None,
+                "remarks": remarks if req.method != "DELETE" else None,
+                "documentStatus": document_status,
+            }),
+            status_code=200,
+            mimetype="application/json",
+        ))
+
+    except Exception as exc:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        logging.exception("Document waiver update failed.")
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": False,
+                "message": str(exc),
+            }),
+            status_code=500,
+            mimetype="application/json",
+        ))
+
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 
@@ -2665,8 +3037,20 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
         rows = cursor.fetchall()
 
         clients = []
+        co_borrowers_by_client_id = {}
+        waived_documents_by_client_id = {}
 
         for row in rows:
+            if row.ClientId not in co_borrowers_by_client_id:
+                co_borrowers_by_client_id[row.ClientId] = (
+                    get_client_co_borrowers(cursor, row.ClientId)
+                )
+
+            if row.ClientId not in waived_documents_by_client_id:
+                waived_documents_by_client_id[row.ClientId] = (
+                    get_client_waived_documents(cursor, row.ClientId)
+                )
+
             clients.append({
                 "id": row.DocumentId or row.ClientId,
                 "clientId": row.ClientId,
@@ -2690,6 +3074,7 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
                 "purpose": row.Purpose,
                 "transactionType": row.TransactionType,
                 "withBorrowersGuarantors": row.WithBorrowersGuarantors,
+                "coBorrowers": co_borrowers_by_client_id[row.ClientId],
                 "anticipatedSettlementDate": str(row.AnticipatedSettlementDate) if row.AnticipatedSettlementDate else None,
                 "vedaIssues": row.VedaIssues,
                 "conductIssues": row.ConductIssues,
@@ -2714,6 +3099,7 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
                 "fileUrl": row.BlobUrl,
                 "submittedAt": str(row.UploadedAt) if row.UploadedAt else None,
                 "documentStatus": row.DocumentStatus,
+                "waivedDocuments": waived_documents_by_client_id[row.ClientId],
                 "verifiedBy": row.VerifiedBy,
                 "verifiedDate": str(row.VerifiedDate) if row.VerifiedDate else None,
                 "remarks": row.Remarks,
@@ -3064,6 +3450,9 @@ def client_login(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json",
             ))
 
+        client_co_borrowers = get_client_co_borrowers(cursor, client.Id)
+        client_document_status = get_client_document_status(cursor, client.Id)
+
         client_payload = {
             "id": client.Id,
             "uniqueId": client.UniqueId,
@@ -3081,6 +3470,7 @@ def client_login(req: func.HttpRequest) -> func.HttpResponse:
             "purpose": client.Purpose,
             "transactionType": client.TransactionType,
             "withBorrowersGuarantors": client.WithBorrowersGuarantors,
+            "coBorrowers": client_co_borrowers,
             "anticipatedSettlementDate": (
                 str(client.AnticipatedSettlementDate)
                 if client.AnticipatedSettlementDate
@@ -3128,6 +3518,14 @@ def client_login(req: func.HttpRequest) -> func.HttpResponse:
                 else None
             ),
             "assignedSpecialist": client.AssignedSpecialist,
+            "requiredDocuments": client_document_status["requiredDocuments"],
+            "uploadedDocuments": client_document_status["uploadedDocuments"],
+            "verifiedDocuments": client_document_status["verifiedDocuments"],
+            "waivedDocuments": client_document_status["waivedDocuments"],
+            "missingDocuments": client_document_status["missingDocuments"],
+            "unverifiedDocuments": client_document_status["unverifiedDocuments"],
+            "documentStatus": client_document_status["documentStatus"],
+            "documentProgress": client_document_status["progress"],
             "mustChangePassword": must_change_password,
             "passwordChangedDate": (
                 str(client.PasswordChangedDate)
