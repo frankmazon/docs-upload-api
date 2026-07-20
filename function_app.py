@@ -12,7 +12,7 @@ import hmac
 import secrets
 import time
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, quote
 from azure.storage.blob import (
     BlobServiceClient,
     generate_blob_sas,
@@ -76,6 +76,79 @@ DOCUMENT_LABELS = {
     "individual-tax-returns": "Individual Tax Returns",
     "last-6-months-mortgage-statements": "Last 6 Months Mortgage Statements",
     "council-rates-notice": "Council Rates Notice",
+}
+
+DOCUMENT_INTELLIGENCE_ENDPOINT = os.getenv(
+    "DOCUMENT_INTELLIGENCE_ENDPOINT",
+    "",
+).strip().rstrip("/")
+DOCUMENT_INTELLIGENCE_KEY = os.getenv(
+    "DOCUMENT_INTELLIGENCE_KEY",
+    "",
+).strip()
+DOCUMENT_INTELLIGENCE_API_VERSION = os.getenv(
+    "DOCUMENT_INTELLIGENCE_API_VERSION",
+    "2024-11-30",
+).strip() or "2024-11-30"
+DOCUMENT_INTELLIGENCE_CLASSIFIER_ID = os.getenv(
+    "DOCUMENT_INTELLIGENCE_CLASSIFIER_ID",
+    "",
+).strip()
+DOCUMENT_COMPARISON_TIMEOUT_SECONDS = max(
+    30,
+    int(os.getenv("DOCUMENT_COMPARISON_TIMEOUT_SECONDS", "120")),
+)
+
+DOCUMENT_TYPE_KEYWORDS = {
+    "payslip": [
+        "payslip", "pay slip", "pay period", "gross pay", "net pay",
+        "earnings", "deductions", "employer", "employee",
+    ],
+    "id": [
+        "driver licence", "driver license", "identity", "date of birth",
+        "licence number", "license number", "expiry", "address",
+    ],
+    "passport": [
+        "passport", "nationality", "date of birth", "date of expiry",
+        "place of birth", "passport number", "issuing authority",
+    ],
+    "bas-from-ato-portal": [
+        "business activity statement", "australian taxation office", "ato",
+        "gst", "pay as you go", "activity statement",
+    ],
+    "business-banking-statements": [
+        "bank statement", "account number", "opening balance",
+        "closing balance", "debit", "credit", "transaction",
+    ],
+    "management-reports-financial-statements": [
+        "financial statements", "balance sheet", "profit and loss",
+        "income statement", "assets", "liabilities", "equity",
+    ],
+    "group-certificate-payment-summary": [
+        "payment summary", "income statement", "gross payments",
+        "tax withheld", "payer", "payee", "financial year",
+    ],
+    "company-tax-returns": [
+        "company tax return", "taxable income", "income tax",
+        "australian taxation office", "abn", "financial year",
+    ],
+    "individual-tax-returns": [
+        "individual tax return", "taxable income", "income tax",
+        "australian taxation office", "tax file number", "financial year",
+    ],
+    "last-6-months-mortgage-statements": [
+        "mortgage statement", "home loan", "loan account", "interest rate",
+        "repayment", "principal", "outstanding balance",
+    ],
+    "council-rates-notice": [
+        "rates notice", "council", "property", "valuation", "rateable",
+        "assessment number", "amount due",
+    ],
+}
+
+DOCUMENT_COMPARISON_STOP_WORDS = {
+    "and", "are", "for", "from", "has", "have", "into", "not", "of",
+    "on", "or", "the", "this", "to", "was", "were", "will", "with",
 }
 
 
@@ -159,6 +232,346 @@ def get_sql_connection():
 
 def clean_value(value):
     return (value or "").strip()
+
+
+def document_intelligence_is_configured() -> bool:
+    return bool(DOCUMENT_INTELLIGENCE_ENDPOINT and DOCUMENT_INTELLIGENCE_KEY)
+
+
+def document_intelligence_headers(content_type=None):
+    headers = {
+        "Ocp-Apim-Subscription-Key": DOCUMENT_INTELLIGENCE_KEY,
+    }
+
+    if content_type:
+        headers["Content-Type"] = content_type
+
+    return headers
+
+
+def wait_for_document_intelligence(operation_url: str) -> dict:
+    deadline = time.monotonic() + DOCUMENT_COMPARISON_TIMEOUT_SECONDS
+
+    while time.monotonic() < deadline:
+        response = requests.get(
+            operation_url,
+            headers=document_intelligence_headers(),
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        status = clean_value(payload.get("status")).lower()
+
+        if status == "succeeded":
+            return payload.get("analyzeResult") or {}
+
+        if status in {"failed", "canceled", "cancelled"}:
+            error = payload.get("error") or {}
+            raise RuntimeError(
+                clean_value(error.get("message"))
+                or "Azure Document Intelligence analysis failed."
+            )
+
+        time.sleep(1)
+
+    raise TimeoutError(
+        "Azure Document Intelligence did not finish before the comparison timeout."
+    )
+
+
+def analyze_document_layout(file_bytes: bytes) -> dict:
+    if not document_intelligence_is_configured():
+        raise RuntimeError(
+            "Azure Document Intelligence endpoint and key are not configured."
+        )
+
+    analyze_url = (
+        f"{DOCUMENT_INTELLIGENCE_ENDPOINT}/documentintelligence/"
+        f"documentModels/prebuilt-layout:analyze"
+        f"?api-version={quote(DOCUMENT_INTELLIGENCE_API_VERSION)}"
+    )
+    response = requests.post(
+        analyze_url,
+        headers=document_intelligence_headers("application/octet-stream"),
+        data=file_bytes,
+        timeout=60,
+    )
+
+    if response.status_code != 202:
+        message = response.text
+        try:
+            error = response.json().get("error") or {}
+            message = clean_value(error.get("message")) or message
+        except (ValueError, AttributeError):
+            pass
+        raise RuntimeError(
+            f"Azure Document Intelligence rejected the document: {message}"
+        )
+
+    operation_url = response.headers.get("Operation-Location")
+
+    if not operation_url:
+        raise RuntimeError(
+            "Azure Document Intelligence did not return an operation URL."
+        )
+
+    return wait_for_document_intelligence(operation_url)
+
+
+def classify_document(file_bytes: bytes):
+    if not DOCUMENT_INTELLIGENCE_CLASSIFIER_ID:
+        return None
+
+    analyze_url = (
+        f"{DOCUMENT_INTELLIGENCE_ENDPOINT}/documentintelligence/"
+        f"documentClassifiers/{quote(DOCUMENT_INTELLIGENCE_CLASSIFIER_ID)}:analyze"
+        f"?api-version={quote(DOCUMENT_INTELLIGENCE_API_VERSION)}&splitMode=none"
+    )
+    response = requests.post(
+        analyze_url,
+        headers=document_intelligence_headers("application/octet-stream"),
+        data=file_bytes,
+        timeout=60,
+    )
+
+    if response.status_code != 202:
+        message = response.text
+        try:
+            error = response.json().get("error") or {}
+            message = clean_value(error.get("message")) or message
+        except (ValueError, AttributeError):
+            pass
+        raise RuntimeError(
+            f"Azure Document Intelligence classifier rejected the document: {message}"
+        )
+
+    operation_url = response.headers.get("Operation-Location")
+
+    if not operation_url:
+        raise RuntimeError(
+            "Azure Document Intelligence classifier returned no operation URL."
+        )
+
+    analyze_result = wait_for_document_intelligence(operation_url)
+    documents = analyze_result.get("documents") or []
+
+    if not documents:
+        return None
+
+    best_match = max(
+        documents,
+        key=lambda item: float(item.get("confidence") or 0),
+    )
+    return {
+        "documentType": normalize_document_type(best_match.get("docType")),
+        "confidence": round(float(best_match.get("confidence") or 0), 4),
+    }
+
+
+def download_private_blob(blob_url: str) -> bytes:
+    storage_connection_string = os.getenv("STORAGE_CONNECTION_STRING")
+
+    if not storage_connection_string:
+        raise RuntimeError("Azure Blob Storage is not configured.")
+
+    parsed_url = urlparse(blob_url)
+    path_parts = parsed_url.path.lstrip("/").split("/", 1)
+
+    if len(path_parts) != 2:
+        raise ValueError("The stored Azure Blob URL is invalid.")
+
+    container_name = unquote(path_parts[0])
+    blob_name = unquote(path_parts[1])
+    blob_service = BlobServiceClient.from_connection_string(
+        storage_connection_string
+    )
+    blob_client = blob_service.get_blob_client(container_name, blob_name)
+    return blob_client.download_blob().readall()
+
+
+def normalize_comparison_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+
+def comparison_tokens(value: str) -> set[str]:
+    return {
+        token
+        for token in normalize_comparison_text(value).split()
+        if len(token) > 2
+        and token not in DOCUMENT_COMPARISON_STOP_WORDS
+        and not token.isdigit()
+    }
+
+
+def text_similarity(client_text: str, reference_text: str) -> float:
+    client_tokens = comparison_tokens(client_text)
+    reference_tokens = comparison_tokens(reference_text)
+
+    if not client_tokens or not reference_tokens:
+        return 0.0
+
+    common = client_tokens.intersection(reference_tokens)
+    union = client_tokens.union(reference_tokens)
+    smaller_set_size = min(len(client_tokens), len(reference_tokens))
+    jaccard = len(common) / len(union) if union else 0.0
+    containment = len(common) / smaller_set_size if smaller_set_size else 0.0
+    return round((jaccard * 0.35) + (containment * 0.65), 4)
+
+
+def document_keyword_score(document_type: str, content: str) -> tuple[float, list[str]]:
+    keywords = DOCUMENT_TYPE_KEYWORDS.get(document_type, [])
+
+    if not keywords:
+        return 0.5, []
+
+    normalized_content = normalize_comparison_text(content)
+    matched_keywords = [
+        keyword
+        for keyword in keywords
+        if normalize_comparison_text(keyword) in normalized_content
+    ]
+    expected_hits = min(4, len(keywords))
+    score = min(1.0, len(matched_keywords) / expected_hits)
+    return round(score, 4), matched_keywords
+
+
+def layout_similarity(client_result: dict, reference_result: dict) -> float:
+    client_pages = client_result.get("pages") or []
+    reference_pages = reference_result.get("pages") or []
+    client_page_count = max(1, len(client_pages))
+    reference_page_count = max(1, len(reference_pages))
+    page_score = min(client_page_count, reference_page_count) / max(
+        client_page_count,
+        reference_page_count,
+    )
+
+    client_lines = sum(len(page.get("lines") or []) for page in client_pages)
+    reference_lines = sum(
+        len(page.get("lines") or []) for page in reference_pages
+    )
+
+    if client_lines and reference_lines:
+        line_score = min(client_lines, reference_lines) / max(
+            client_lines,
+            reference_lines,
+        )
+    else:
+        line_score = page_score
+
+    return round((page_score * 0.6) + (line_score * 0.4), 4)
+
+
+def build_document_comparison(
+    document_type: str,
+    client_bytes: bytes,
+    reference_bytes: bytes,
+) -> dict:
+    client_hash = hashlib.sha256(client_bytes).hexdigest()
+    reference_hash = hashlib.sha256(reference_bytes).hexdigest()
+
+    if hmac.compare_digest(client_hash, reference_hash):
+        return {
+            "result": "Matched",
+            "confidence": 1.0,
+            "exactMatch": True,
+            "textSimilarity": 1.0,
+            "keywordScore": 1.0,
+            "layoutSimilarity": 1.0,
+            "predictedDocumentType": document_type,
+            "classifierConfidence": 1.0,
+            "matchedKeywords": [],
+            "reasons": ["The submitted file is byte-for-byte identical to the admin reference."],
+            "clientContentHash": client_hash,
+            "referenceContentHash": reference_hash,
+        }
+
+    client_layout = analyze_document_layout(client_bytes)
+    reference_layout = analyze_document_layout(reference_bytes)
+    client_text = client_layout.get("content") or ""
+    reference_text = reference_layout.get("content") or ""
+    overlap_score = text_similarity(client_text, reference_text)
+    keyword_score, matched_keywords = document_keyword_score(
+        document_type,
+        client_text,
+    )
+    structure_score = layout_similarity(client_layout, reference_layout)
+    classifier_result = classify_document(client_bytes)
+    predicted_document_type = None
+    classifier_confidence = None
+
+    if classifier_result:
+        predicted_document_type = classifier_result["documentType"]
+        classifier_confidence = classifier_result["confidence"]
+        classifier_matches = predicted_document_type == document_type
+        classifier_score = (
+            classifier_confidence
+            if classifier_matches
+            else max(0.0, 1.0 - classifier_confidence)
+        )
+        confidence = (
+            (classifier_score * 0.65)
+            + (keyword_score * 0.2)
+            + (overlap_score * 0.1)
+            + (structure_score * 0.05)
+        )
+    else:
+        classifier_matches = None
+        confidence = (
+            (keyword_score * 0.55)
+            + (overlap_score * 0.3)
+            + (structure_score * 0.15)
+        )
+
+    confidence = round(min(1.0, max(0.0, confidence)), 4)
+    reasons = []
+
+    if classifier_result:
+        reasons.append(
+            "Classifier identified the file as "
+            f"{format_document_type(predicted_document_type)} "
+            f"with {round(classifier_confidence * 100)}% confidence."
+        )
+
+    if matched_keywords:
+        reasons.append(
+            "Expected document signals found: " + ", ".join(matched_keywords[:6]) + "."
+        )
+    else:
+        reasons.append("No strong expected document keywords were detected.")
+
+    reasons.append(
+        f"Text/template similarity is {round(overlap_score * 100)}%; "
+        f"layout similarity is {round(structure_score * 100)}%."
+    )
+
+    if (
+        classifier_result
+        and not classifier_matches
+        and classifier_confidence >= 0.75
+    ):
+        result = "NotMatched"
+        reasons.insert(0, "The trained classifier identified a different document type.")
+    elif confidence >= 0.78 and keyword_score >= 0.5:
+        result = "Matched"
+    elif confidence <= 0.3 and keyword_score <= 0.25:
+        result = "NotMatched"
+    else:
+        result = "NeedsReview"
+
+    return {
+        "result": result,
+        "confidence": confidence,
+        "exactMatch": False,
+        "textSimilarity": overlap_score,
+        "keywordScore": keyword_score,
+        "layoutSimilarity": structure_score,
+        "predictedDocumentType": predicted_document_type,
+        "classifierConfidence": classifier_confidence,
+        "matchedKeywords": matched_keywords,
+        "reasons": reasons,
+        "clientContentHash": client_hash,
+        "referenceContentHash": reference_hash,
+    }
 
 
 def hash_client_password(password: str) -> str:
@@ -2720,6 +3133,687 @@ def waive_client_document(req: func.HttpRequest) -> func.HttpResponse:
                 pass
 
         logging.exception("Document waiver update failed.")
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": False,
+                "message": str(exc),
+            }),
+            status_code=500,
+            mimetype="application/json",
+        ))
+
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+@app.route(
+    route="clients/{client_id}/admin-reference-documents/{document_type}",
+    auth_level=func.AuthLevel.ANONYMOUS,
+    methods=["GET", "POST", "DELETE", "OPTIONS"],
+)
+def admin_reference_document(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    conn = None
+    cursor = None
+    new_blob_client = None
+    database_committed = False
+
+    try:
+        client_id_text = clean_value(req.route_params.get("client_id"))
+        document_type = normalize_document_type(
+            req.route_params.get("document_type")
+        )
+
+        if not client_id_text.isdigit() or not document_type:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "A valid client ID and document type are required.",
+                }),
+                status_code=400,
+                mimetype="application/json",
+            ))
+
+        client_id = int(client_id_text)
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT TOP 1 Id, TransactionType
+            FROM dbo.Clients
+            WHERE Id = ?
+        """, client_id)
+        client = cursor.fetchone()
+
+        if not client:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "Client not found.",
+                }),
+                status_code=404,
+                mimetype="application/json",
+            ))
+
+        if not is_valid_document_type(client.TransactionType, document_type):
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "This document type is not valid for the client.",
+                    "documentType": document_type,
+                    "allowedDocumentTypes": get_required_documents(
+                        client.TransactionType
+                    ),
+                }),
+                status_code=400,
+                mimetype="application/json",
+            ))
+
+        cursor.execute("""
+            SELECT TOP 1
+                Id,
+                ClientId,
+                DocumentType,
+                FileName,
+                BlobUrl,
+                UploadedBy,
+                UploadedAt
+            FROM dbo.AdminReferenceDocuments
+            WHERE ClientId = ? AND DocumentType = ?
+            ORDER BY UploadedAt DESC, Id DESC
+        """, client_id, document_type)
+        existing_reference = cursor.fetchone()
+
+        if req.method == "GET":
+            reference_document = None
+
+            if existing_reference:
+                reference_document = {
+                    "id": existing_reference.Id,
+                    "clientId": existing_reference.ClientId,
+                    "documentType": normalize_document_type(
+                        existing_reference.DocumentType
+                    ),
+                    "documentLabel": format_document_type(
+                        existing_reference.DocumentType
+                    ),
+                    "fileName": existing_reference.FileName,
+                    "blobUrl": existing_reference.BlobUrl,
+                    "uploadedBy": existing_reference.UploadedBy,
+                    "uploadedAt": (
+                        existing_reference.UploadedAt.isoformat()
+                        if existing_reference.UploadedAt
+                        else None
+                    ),
+                }
+
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": True,
+                    "clientId": client_id,
+                    "documentType": document_type,
+                    "referenceDocument": reference_document,
+                }),
+                status_code=200,
+                mimetype="application/json",
+            ))
+
+        storage_connection_string = os.getenv("STORAGE_CONNECTION_STRING")
+        container_name = os.getenv("BLOB_CONTAINER_NAME", "client-files")
+
+        if not storage_connection_string:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "Azure Blob Storage is not configured.",
+                }),
+                status_code=500,
+                mimetype="application/json",
+            ))
+
+        blob_service = BlobServiceClient.from_connection_string(
+            storage_connection_string
+        )
+        container_client = blob_service.get_container_client(container_name)
+
+        if req.method == "DELETE":
+            if not existing_reference:
+                return add_cors(func.HttpResponse(
+                    json.dumps({
+                        "success": True,
+                        "message": "No admin reference document was found.",
+                        "clientId": client_id,
+                        "documentType": document_type,
+                    }),
+                    status_code=200,
+                    mimetype="application/json",
+                ))
+
+            cursor.execute("""
+                DELETE FROM dbo.AdminReferenceDocuments
+                WHERE Id = ?
+            """, existing_reference.Id)
+            conn.commit()
+            database_committed = True
+
+            try:
+                parsed_url = urlparse(existing_reference.BlobUrl)
+                path_parts = parsed_url.path.lstrip("/").split("/", 1)
+
+                if len(path_parts) == 2:
+                    container_client.delete_blob(unquote(path_parts[1]))
+            except Exception:
+                logging.exception(
+                    "Failed to delete admin reference blob %s.",
+                    existing_reference.Id,
+                )
+
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": True,
+                    "message": "Admin reference document removed.",
+                    "clientId": client_id,
+                    "documentType": document_type,
+                }),
+                status_code=200,
+                mimetype="application/json",
+            ))
+
+        uploaded_file = req.files.get("file")
+
+        if not uploaded_file or not clean_value(uploaded_file.filename):
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "Select an admin reference file to upload.",
+                }),
+                status_code=400,
+                mimetype="application/json",
+            ))
+
+        uploaded_filename = clean_value(uploaded_file.filename)
+        allowed_extensions = {
+            ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".webp",
+            ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+        }
+        file_extension = os.path.splitext(uploaded_filename.lower())[1]
+
+        if file_extension not in allowed_extensions:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "Unsupported admin reference file type.",
+                    "allowedExtensions": sorted(allowed_extensions),
+                }),
+                status_code=400,
+                mimetype="application/json",
+            ))
+
+        uploaded_by = clean_value(
+            req.form.get("uploadedBy") or req.form.get("adminName") or "Admin"
+        )
+        safe_filename = re.sub(
+            r"[^A-Za-z0-9._-]+",
+            "_",
+            uploaded_filename,
+        ).strip("._") or f"reference{file_extension}"
+        blob_name = (
+            f"admin-references/{client_id}/{document_type}/"
+            f"{uuid.uuid4().hex}-{safe_filename}"
+        )
+        new_blob_client = container_client.get_blob_client(blob_name)
+        new_blob_client.upload_blob(uploaded_file.stream.read(), overwrite=True)
+        new_blob_url = new_blob_client.url
+
+        if existing_reference:
+            cursor.execute("""
+                UPDATE dbo.AdminReferenceDocuments
+                SET
+                    FileName = ?,
+                    BlobUrl = ?,
+                    UploadedBy = ?,
+                    UploadedAt = SYSUTCDATETIME()
+                WHERE Id = ?
+            """, (
+                uploaded_filename,
+                new_blob_url,
+                uploaded_by,
+                existing_reference.Id,
+            ))
+            reference_id = existing_reference.Id
+        else:
+            cursor.execute("""
+                INSERT INTO dbo.AdminReferenceDocuments (
+                    ClientId,
+                    DocumentType,
+                    FileName,
+                    BlobUrl,
+                    UploadedBy,
+                    UploadedAt
+                )
+                OUTPUT INSERTED.Id
+                VALUES (?, ?, ?, ?, ?, SYSUTCDATETIME())
+            """, (
+                client_id,
+                document_type,
+                uploaded_filename,
+                new_blob_url,
+                uploaded_by,
+            ))
+            reference_id = cursor.fetchone()[0]
+
+        conn.commit()
+        database_committed = True
+
+        if existing_reference and existing_reference.BlobUrl:
+            try:
+                parsed_old_url = urlparse(existing_reference.BlobUrl)
+                old_path_parts = parsed_old_url.path.lstrip("/").split("/", 1)
+
+                if len(old_path_parts) == 2:
+                    container_client.delete_blob(unquote(old_path_parts[1]))
+            except Exception:
+                logging.exception(
+                    "Failed to delete replaced admin reference blob %s.",
+                    existing_reference.Id,
+                )
+
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": True,
+                "message": (
+                    "Admin reference document replaced."
+                    if existing_reference
+                    else "Admin reference document uploaded."
+                ),
+                "referenceDocument": {
+                    "id": reference_id,
+                    "clientId": client_id,
+                    "documentType": document_type,
+                    "documentLabel": format_document_type(document_type),
+                    "fileName": uploaded_filename,
+                    "blobUrl": new_blob_url,
+                    "uploadedBy": uploaded_by,
+                    "uploadedAt": datetime.utcnow().isoformat(),
+                },
+            }),
+            status_code=200,
+            mimetype="application/json",
+        ))
+
+    except Exception as exc:
+        if conn and not database_committed:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        if new_blob_client is not None and not database_committed:
+            try:
+                new_blob_client.delete_blob()
+            except Exception:
+                logging.exception(
+                    "Failed to clean up an uncommitted admin reference blob."
+                )
+
+        logging.exception("Admin reference document request failed.")
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": False,
+                "message": str(exc),
+            }),
+            status_code=500,
+            mimetype="application/json",
+        ))
+
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+@app.route(
+    route="documents/{document_id}/compare",
+    auth_level=func.AuthLevel.ANONYMOUS,
+    methods=["POST", "OPTIONS"],
+)
+def compare_document_with_admin_reference(
+    req: func.HttpRequest,
+) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    conn = None
+    cursor = None
+
+    try:
+        document_id_text = clean_value(req.route_params.get("document_id"))
+
+        if not document_id_text.isdigit():
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "A valid client document ID is required.",
+                }),
+                status_code=400,
+                mimetype="application/json",
+            ))
+
+        if not document_intelligence_is_configured():
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "Azure Document Intelligence is not configured in this Function App.",
+                }),
+                status_code=503,
+                mimetype="application/json",
+            ))
+
+        document_id = int(document_id_text)
+        data = {}
+
+        try:
+            data = req.get_json() or {}
+        except ValueError:
+            data = {}
+
+        compared_by = clean_value(
+            data.get("comparedBy") or data.get("adminName") or "AI"
+        )
+        force_comparison = str(data.get("force") or "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT TOP 1
+                Id,
+                ClientId,
+                DocumentType,
+                FileName,
+                BlobUrl
+            FROM dbo.Documents
+            WHERE Id = ?
+        """, document_id)
+        document = cursor.fetchone()
+
+        if not document:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "Client document not found.",
+                }),
+                status_code=404,
+                mimetype="application/json",
+            ))
+
+        document_type = normalize_document_type(document.DocumentType)
+        cursor.execute("""
+            SELECT TOP 1
+                Id,
+                ClientId,
+                DocumentType,
+                FileName,
+                BlobUrl
+            FROM dbo.AdminReferenceDocuments
+            WHERE ClientId = ? AND DocumentType = ?
+            ORDER BY UploadedAt DESC, Id DESC
+        """, document.ClientId, document_type)
+        reference = cursor.fetchone()
+
+        if not reference:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "Upload an admin reference document before running AI comparison.",
+                    "clientId": document.ClientId,
+                    "documentId": document_id,
+                    "documentType": document_type,
+                }),
+                status_code=409,
+                mimetype="application/json",
+            ))
+
+        supported_extensions = {
+            ".pdf", ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff",
+            ".heif", ".docx", ".xlsx", ".pptx", ".html",
+        }
+        client_extension = os.path.splitext(
+            clean_value(document.FileName).lower()
+        )[1]
+        reference_extension = os.path.splitext(
+            clean_value(reference.FileName).lower()
+        )[1]
+
+        if (
+            client_extension not in supported_extensions
+            or reference_extension not in supported_extensions
+        ):
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": (
+                        "AI comparison supports PDF, JPEG, PNG, BMP, TIFF, HEIF, "
+                        "DOCX, XLSX, PPTX, and HTML files. Convert the unsupported "
+                        "file and upload it again."
+                    ),
+                }),
+                status_code=415,
+                mimetype="application/json",
+            ))
+
+        cursor.close()
+        cursor = None
+        conn.close()
+        conn = None
+
+        client_bytes = download_private_blob(document.BlobUrl)
+        reference_bytes = download_private_blob(reference.BlobUrl)
+
+        if not client_bytes or not reference_bytes:
+            raise ValueError("One of the comparison files is empty.")
+
+        client_hash = hashlib.sha256(client_bytes).hexdigest()
+        reference_hash = hashlib.sha256(reference_bytes).hexdigest()
+
+        if not force_comparison:
+            conn = get_sql_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT TOP 1
+                    Id,
+                    Result,
+                    Confidence,
+                    ExactMatch,
+                    TextSimilarity,
+                    KeywordScore,
+                    LayoutSimilarity,
+                    PredictedDocumentType,
+                    ClassifierConfidence,
+                    ReasonsJson,
+                    ComparedBy,
+                    ComparedAt
+                FROM dbo.DocumentComparisonResults
+                WHERE DocumentId = ?
+                  AND AdminReferenceDocumentId = ?
+                  AND ClientContentHash = ?
+                  AND ReferenceContentHash = ?
+                ORDER BY ComparedAt DESC, Id DESC
+            """, (
+                document_id,
+                reference.Id,
+                client_hash,
+                reference_hash,
+            ))
+            cached = cursor.fetchone()
+
+            if cached:
+                try:
+                    cached_reasons = json.loads(cached.ReasonsJson or "[]")
+                except (ValueError, TypeError):
+                    cached_reasons = []
+
+                return add_cors(func.HttpResponse(
+                    json.dumps({
+                        "success": True,
+                        "message": "Existing automatic comparison loaded.",
+                        "comparison": {
+                            "id": cached.Id,
+                            "documentId": document_id,
+                            "adminReferenceDocumentId": reference.Id,
+                            "clientId": document.ClientId,
+                            "documentType": document_type,
+                            "documentLabel": format_document_type(document_type),
+                            "clientFileName": document.FileName,
+                            "referenceFileName": reference.FileName,
+                            "result": cached.Result,
+                            "confidence": float(cached.Confidence or 0),
+                            "confidencePercent": round(float(cached.Confidence or 0) * 100),
+                            "exactMatch": bool(cached.ExactMatch),
+                            "textSimilarity": float(cached.TextSimilarity or 0),
+                            "keywordScore": float(cached.KeywordScore or 0),
+                            "layoutSimilarity": float(cached.LayoutSimilarity or 0),
+                            "predictedDocumentType": cached.PredictedDocumentType,
+                            "classifierConfidence": (
+                                float(cached.ClassifierConfidence)
+                                if cached.ClassifierConfidence is not None
+                                else None
+                            ),
+                            "matchedKeywords": [],
+                            "reasons": cached_reasons,
+                            "requiresHumanReview": cached.Result != "Matched",
+                            "comparedBy": cached.ComparedBy,
+                            "comparedAt": (
+                                cached.ComparedAt.isoformat()
+                                if cached.ComparedAt
+                                else None
+                            ),
+                            "cached": True,
+                        },
+                    }),
+                    status_code=200,
+                    mimetype="application/json",
+                ))
+
+            cursor.close()
+            cursor = None
+            conn.close()
+            conn = None
+
+        comparison = build_document_comparison(
+            document_type,
+            client_bytes,
+            reference_bytes,
+        )
+
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO dbo.DocumentComparisonResults (
+                DocumentId,
+                AdminReferenceDocumentId,
+                ExpectedDocumentType,
+                PredictedDocumentType,
+                Result,
+                Confidence,
+                ExactMatch,
+                TextSimilarity,
+                KeywordScore,
+                LayoutSimilarity,
+                ClassifierConfidence,
+                ClientContentHash,
+                ReferenceContentHash,
+                ReasonsJson,
+                ComparedBy,
+                ComparedAt
+            )
+            OUTPUT INSERTED.Id, INSERTED.ComparedAt
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME())
+        """, (
+            document_id,
+            reference.Id,
+            document_type,
+            comparison["predictedDocumentType"],
+            comparison["result"],
+            comparison["confidence"],
+            1 if comparison["exactMatch"] else 0,
+            comparison["textSimilarity"],
+            comparison["keywordScore"],
+            comparison["layoutSimilarity"],
+            comparison["classifierConfidence"],
+            comparison["clientContentHash"],
+            comparison["referenceContentHash"],
+            json.dumps(comparison["reasons"]),
+            compared_by,
+        ))
+        inserted = cursor.fetchone()
+        conn.commit()
+
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": True,
+                "message": "Automatic document comparison completed.",
+                "comparison": {
+                    "id": inserted.Id,
+                    "documentId": document_id,
+                    "adminReferenceDocumentId": reference.Id,
+                    "clientId": document.ClientId,
+                    "documentType": document_type,
+                    "documentLabel": format_document_type(document_type),
+                    "clientFileName": document.FileName,
+                    "referenceFileName": reference.FileName,
+                    "result": comparison["result"],
+                    "confidence": comparison["confidence"],
+                    "confidencePercent": round(comparison["confidence"] * 100),
+                    "exactMatch": comparison["exactMatch"],
+                    "textSimilarity": comparison["textSimilarity"],
+                    "keywordScore": comparison["keywordScore"],
+                    "layoutSimilarity": comparison["layoutSimilarity"],
+                    "predictedDocumentType": comparison["predictedDocumentType"],
+                    "classifierConfidence": comparison["classifierConfidence"],
+                    "matchedKeywords": comparison["matchedKeywords"],
+                    "reasons": comparison["reasons"],
+                    "requiresHumanReview": comparison["result"] != "Matched",
+                    "comparedBy": compared_by,
+                    "comparedAt": (
+                        inserted.ComparedAt.isoformat()
+                        if inserted.ComparedAt
+                        else datetime.utcnow().isoformat()
+                    ),
+                },
+            }),
+            status_code=200,
+            mimetype="application/json",
+        ))
+
+    except Exception as exc:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        logging.exception("Automatic document comparison failed.")
         return add_cors(func.HttpResponse(
             json.dumps({
                 "success": False,
