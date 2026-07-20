@@ -11,7 +11,7 @@ import hashlib
 import hmac
 import secrets
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, unquote, quote
 from azure.storage.blob import (
     BlobServiceClient,
@@ -3951,7 +3951,7 @@ def get_file_url(req: func.HttpRequest) -> func.HttpResponse:
             ))
 
         storage_connection_string = os.getenv("STORAGE_CONNECTION_STRING")
-        container_name = os.getenv("BLOB_CONTAINER_NAME", "client-files")
+        configured_container = os.getenv("BLOB_CONTAINER_NAME", "client-files")
 
         parsed_url = urlparse(blob_url)
         path_parts = parsed_url.path.lstrip("/").split("/", 1)
@@ -3959,6 +3959,7 @@ def get_file_url(req: func.HttpRequest) -> func.HttpResponse:
         if len(path_parts) < 2:
             raise Exception("Invalid blob URL.")
 
+        container_name = unquote(path_parts[0]) or configured_container
         blob_name = unquote(path_parts[1])
 
         account_name = (
@@ -3973,25 +3974,37 @@ def get_file_url(req: func.HttpRequest) -> func.HttpResponse:
             .split(";")[0]
         )
 
+        blob_service = BlobServiceClient.from_connection_string(
+            storage_connection_string
+        )
+        blob_client = blob_service.get_blob_client(
+            container=container_name,
+            blob=blob_name,
+        )
+
+        # Use timezone-aware values and allow for small clock differences between
+        # the Function worker and Azure Storage.
+        sas_now = datetime.now(timezone.utc)
         sas_token = generate_blob_sas(
             account_name=account_name,
             container_name=container_name,
             blob_name=blob_name,
             account_key=account_key,
             permission=BlobSasPermissions(read=True),
-            expiry=datetime.utcnow() + timedelta(minutes=30),
+            start=sas_now - timedelta(minutes=5),
+            expiry=sas_now + timedelta(minutes=60),
         )
 
-        secure_url = (
-            f"https://{account_name}.blob.core.windows.net/"
-            f"{container_name}/{blob_name}?{sas_token}"
-        )
+        # BlobClient.url correctly escapes literal percent signs and spaces in
+        # blob names. Building this URL manually can produce an invalid SAS
+        # signature for names such as "2ND%20BIKERS%20PRINTING.pdf".
+        secure_url = f"{blob_client.url}?{sas_token}"
 
         return add_cors(func.HttpResponse(
             json.dumps({
                 "success": True,
                 "url": secure_url,
-                "expiresInMinutes": 30
+                "expiresInMinutes": 60
             }),
             status_code=200,
             mimetype="application/json"
