@@ -231,7 +231,13 @@ def get_sql_connection():
 
 
 def clean_value(value):
-    return (value or "").strip()
+    if not value:
+        return ""
+
+    if isinstance(value, str):
+        return value.strip()
+
+    return str(value).strip()
 
 
 def document_intelligence_is_configured() -> bool:
@@ -794,6 +800,32 @@ def replace_client_co_borrowers(
             co_borrower.get("phone", ""),
             co_borrower.get("email", ""),
         ))
+
+
+def client_message_to_dict(row) -> dict:
+    created_at = row.CreatedAt
+
+    if isinstance(created_at, datetime):
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+
+        created_at = created_at.astimezone(timezone.utc).isoformat().replace(
+            "+00:00",
+            "Z",
+        )
+    elif created_at:
+        created_at = str(created_at)
+    else:
+        created_at = None
+
+    return {
+        "id": row.Id,
+        "clientId": row.ClientId,
+        "senderType": clean_value(row.SenderType) or "Client",
+        "senderName": clean_value(row.SenderName) or "Client",
+        "message": row.MessageText or "",
+        "createdAt": created_at,
+    }
 
 
 def extract_ghl_contact_id(ghl_sync):
@@ -4083,7 +4115,17 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
                 c.CompletedDate,
                 c.ReminderSent,
                 c.LastReminderDate,
-                c.AssignedSpecialist
+                c.AssignedSpecialist,
+                (
+                    SELECT COUNT(*)
+                    FROM dbo.ClientMessages cm
+                    WHERE cm.ClientId = c.Id
+                ) AS MessageCount,
+                (
+                    SELECT MAX(cm.CreatedAt)
+                    FROM dbo.ClientMessages cm
+                    WHERE cm.ClientId = c.Id
+                ) AS LatestMessageAt
             FROM Clients c
             LEFT JOIN Documents d ON d.ClientId = c.Id
             WHERE 1 = 1
@@ -4215,6 +4257,12 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
                 "reminderSent": bool(row.ReminderSent) if row.ReminderSent is not None else False,
                 "lastReminderDate": str(row.LastReminderDate) if row.LastReminderDate else None,
                 "assignedSpecialist": row.AssignedSpecialist,
+                "messageCount": int(row.MessageCount or 0),
+                "latestMessageAt": (
+                    str(row.LatestMessageAt)
+                    if row.LatestMessageAt
+                    else None
+                ),
             })
 
         cursor.close()
@@ -4239,6 +4287,234 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         ))
+
+
+def handle_client_messages(
+    req: func.HttpRequest,
+    route_client_id=None,
+) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    conn = None
+    cursor = None
+
+    try:
+        data = {}
+
+        if req.method == "POST":
+            try:
+                data = req.get_json()
+            except ValueError:
+                data = {}
+
+        client_reference = clean_value(
+            route_client_id
+            or req.params.get("clientId")
+            or req.params.get("uniqueId")
+            or data.get("clientId")
+            or data.get("uniqueId")
+        )
+
+        if not client_reference:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "Client ID is required.",
+                }),
+                status_code=400,
+                mimetype="application/json",
+            ))
+
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+
+        if client_reference.isdigit():
+            cursor.execute("""
+                SELECT
+                    Id,
+                    FirstName,
+                    MiddleName,
+                    LastName
+                FROM dbo.Clients
+                WHERE Id = ?
+            """, int(client_reference))
+        else:
+            cursor.execute("""
+            SELECT
+                Id,
+                FirstName,
+                MiddleName,
+                LastName
+            FROM dbo.Clients
+            WHERE UniqueId = ?
+        """, client_reference)
+
+        client = cursor.fetchone()
+
+        if not client:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "Client not found.",
+                }),
+                status_code=404,
+                mimetype="application/json",
+            ))
+
+        client_id = int(client.Id)
+
+        cursor.execute(
+            "SELECT OBJECT_ID(N'dbo.ClientMessages', N'U')"
+        )
+        table_id_row = cursor.fetchone()
+
+        if not table_id_row or table_id_row[0] is None:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": (
+                        "Client message storage is not installed. "
+                        "Run add_client_messages.sql in Azure SQL first."
+                    ),
+                }),
+                status_code=503,
+                mimetype="application/json",
+            ))
+
+        sender_name = " ".join(filter(None, [
+            clean_value(client.FirstName),
+            clean_value(client.MiddleName),
+            clean_value(client.LastName),
+        ])) or "Client"
+
+        if req.method == "POST":
+            message = clean_value(data.get("message") or data.get("note"))
+
+            if not message:
+                return add_cors(func.HttpResponse(
+                    json.dumps({
+                        "success": False,
+                        "message": "Please enter a message.",
+                    }),
+                    status_code=400,
+                    mimetype="application/json",
+                ))
+
+            if len(message) > 2000:
+                return add_cors(func.HttpResponse(
+                    json.dumps({
+                        "success": False,
+                        "message": "The message cannot exceed 2,000 characters.",
+                    }),
+                    status_code=400,
+                    mimetype="application/json",
+                ))
+
+            cursor.execute("""
+                INSERT INTO dbo.ClientMessages (
+                    ClientId,
+                    SenderType,
+                    SenderName,
+                    MessageText
+                )
+                OUTPUT
+                    INSERTED.Id,
+                    INSERTED.ClientId,
+                    INSERTED.SenderType,
+                    INSERTED.SenderName,
+                    INSERTED.MessageText,
+                    INSERTED.CreatedAt
+                VALUES (?, 'Client', ?, ?)
+            """, client_id, sender_name, message)
+
+            created_message = cursor.fetchone()
+            conn.commit()
+
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": True,
+                    "message": "Your note was sent successfully.",
+                    "clientMessage": client_message_to_dict(created_message),
+                }),
+                status_code=201,
+                mimetype="application/json",
+            ))
+
+        cursor.execute("""
+            SELECT
+                Id,
+                ClientId,
+                SenderType,
+                SenderName,
+                MessageText,
+                CreatedAt
+            FROM dbo.ClientMessages
+            WHERE ClientId = ?
+            ORDER BY CreatedAt ASC, Id ASC
+        """, client_id)
+
+        messages = [
+            client_message_to_dict(row)
+            for row in cursor.fetchall()
+        ]
+
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": True,
+                "clientId": client_id,
+                "messages": messages,
+                "count": len(messages),
+            }),
+            status_code=200,
+            mimetype="application/json",
+        ))
+
+    except Exception as exc:
+        logging.exception("Client messages request failed.")
+
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": False,
+                "message": str(exc),
+            }),
+            status_code=500,
+            mimetype="application/json",
+        ))
+
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+@app.route(
+    route="client-messages",
+    auth_level=func.AuthLevel.ANONYMOUS,
+    methods=["GET", "POST", "OPTIONS"],
+)
+def client_messages(req: func.HttpRequest) -> func.HttpResponse:
+    return handle_client_messages(req)
+
+
+@app.route(
+    route="clients/{client_id}/messages",
+    auth_level=func.AuthLevel.ANONYMOUS,
+    methods=["GET", "POST", "OPTIONS"],
+)
+def client_messages_legacy(req: func.HttpRequest) -> func.HttpResponse:
+    return handle_client_messages(
+        req,
+        req.route_params.get("client_id"),
+    )
 
 
 @app.route(
