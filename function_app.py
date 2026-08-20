@@ -38,6 +38,18 @@ GHL_PASSWORD_CHANGED_TAG = os.getenv(
     "client-password-changed",
 ).strip() or "client-password-changed"
 
+GHL_REFERRER_ACCOUNT_CREATED_TAG = os.getenv(
+    "GHL_REFERRER_ACCOUNT_CREATED_TAG", "referrer-account-created"
+).strip() or "referrer-account-created"
+
+GHL_REFERRAL_SUBMITTED_TAG = os.getenv(
+    "GHL_REFERRAL_SUBMITTED_TAG", "referral-submission-received"
+).strip() or "referral-submission-received"
+
+GHL_COBORROWER_SUBMISSION_TAG = os.getenv(
+    "GHL_COBORROWER_SUBMISSION_TAG", "co-borrower-submission-received"
+).strip() or "co-borrower-submission-received"
+
 PASSWORD_HASH_ITERATIONS = int(
     os.getenv("PASSWORD_HASH_ITERATIONS", "310000")
 )
@@ -182,9 +194,14 @@ GHL_CUSTOM_FIELD_CONFIG = {
     "GHL_REFERRER_LAST_NAME_FIELD": ["referrer_last_name"],
     "GHL_REFERRER_PHONE_FIELD": ["referrer_phone", "referrer_mobile"],
     "GHL_REFERRER_EMAIL_FIELD": ["referrer_email"],
+    "GHL_REFERRER_ID_FIELD": ["referrer_id", "rf_id"],
+    "GHL_REFERRER_CODE_FIELD": ["unique_referrer_code", "referral_code"],
+    "GHL_REFERRED_CLIENT_NAME_FIELD": ["referred_client_name", "client_name"],
 }
 
 REQUIRED_INTAKE_FIELDS = {
+    "firstName": "First name",
+    "lastName": "Last name",
     "email": "Email",
     "phone": "Phone number",
     "source": "Source",
@@ -195,6 +212,33 @@ REQUIRED_INTAKE_FIELDS = {
     "purpose": "Purpose",
     "transactionType": "Transaction type",
     "anticipatedSettlementDate": "Anticipated Settlement Date",
+}
+
+ALL_SUPPORTED_DOCUMENT_TYPES = sorted({
+    document_type
+    for document_types in TRANSACTION_DOCUMENTS.values()
+    for document_type in document_types
+})
+
+SIMPLIFIED_INTAKE_FIELDS = {
+    "firstName": "First name",
+    "lastName": "Last name",
+    "email": "Email",
+    "phone": "Phone number",
+    "source": "Source",
+    "borrowerType": "Borrower type",
+    "transactionType": "Financial statements availability",
+    "withBorrowersGuarantors": "Co-borrower selection",
+    "clientNeedsObjectives": "Objective / Tell us your story",
+    "hasProperty": "Property ownership",
+    "isSelfEmployed": "Self-employment status",
+    "hasTaxReturn": "Tax return availability",
+}
+
+REFERRAL_INTAKE_FIELDS = {
+    "referrerProfession": "Referrer profession",
+    "dpnIssues": "DPN issues",
+    "isClientCompliant": "Client compliance",
 }
 
 LEAD_TYPE_LABELS = {
@@ -974,7 +1018,10 @@ def is_valid_document_type(transaction_type: str, document_type: str) -> bool:
     if not normalized_document_type:
         return True
 
-    return normalized_document_type in get_required_documents(transaction_type)
+    # The redesigned intake creates a conditional checklist from property,
+    # employment and tax-return answers. A required document can therefore
+    # come from either legacy transaction group.
+    return normalized_document_type in ALL_SUPPORTED_DOCUMENT_TYPES
 
 
 def format_document_type(document_type: str) -> str:
@@ -1624,10 +1671,10 @@ def extract_ghl_custom_fields(response_body):
     return []
 
 
-def get_ghl_custom_field_map(ghl_api_base, location_id):
+def get_ghl_custom_field_map(ghl_api_base, location_id, force_refresh=False):
     global _GHL_FIELD_MAP_CACHE
 
-    if _GHL_FIELD_MAP_CACHE is not None:
+    if _GHL_FIELD_MAP_CACHE is not None and not force_refresh:
         return _GHL_FIELD_MAP_CACHE
 
     field_map = {}
@@ -2082,6 +2129,322 @@ def login(req: func.HttpRequest) -> func.HttpResponse:
         ))
 
 
+def upsert_referrer_account(
+    cursor,
+    referral_code,
+    first_name,
+    middle_name,
+    last_name,
+    email,
+    phone,
+    profession,
+):
+    """Resolve an existing referral code or create the first RF account."""
+    referral_code = clean_value(referral_code).upper()
+    email = clean_value(email).lower()
+
+    if referral_code:
+        cursor.execute("""
+            SELECT TOP 1 Id, ReferrerId, ReferralCode, FirstName, MiddleName,
+                LastName, Email, Phone, Profession, MustChangePassword,
+                GHLContactId
+            FROM dbo.Referrers
+            WHERE ReferralCode = ? AND IsActive = 1
+        """, referral_code)
+        existing = cursor.fetchone()
+        if not existing:
+            raise ValueError("The Unique Referrer Code was not found.")
+
+        return {
+            "id": existing.Id,
+            "referrerId": existing.ReferrerId,
+            "referralCode": existing.ReferralCode,
+            "email": existing.Email,
+            "firstName": existing.FirstName,
+            "middleName": existing.MiddleName,
+            "lastName": existing.LastName,
+            "phone": existing.Phone,
+            "profession": existing.Profession,
+            "ghlContactId": existing.GHLContactId,
+            "created": False,
+        }
+
+    if not first_name or not last_name or not email:
+        raise ValueError(
+            "Referrer first name, last name, and email are required to create an account."
+        )
+
+    cursor.execute("""
+        SELECT TOP 1 Id, ReferrerId, ReferralCode
+        FROM dbo.Referrers
+        WHERE LOWER(Email) = LOWER(?) AND IsActive = 1
+        ORDER BY Id ASC
+    """, email)
+    email_match = cursor.fetchone()
+    if email_match:
+        return upsert_referrer_account(
+            cursor, email_match.ReferralCode, first_name, middle_name,
+            last_name, email, phone, profession
+        )
+
+    referrer_id = f"RF-{uuid.uuid4().hex[:8].upper()}"
+    referral_code = f"REF-{uuid.uuid4().hex[:8].upper()}"
+    temporary_password = last_name.strip()
+    password_hash = hash_client_password(temporary_password)
+
+    cursor.execute("""
+        INSERT INTO dbo.Referrers (
+            ReferrerId, ReferralCode, FirstName, MiddleName, LastName,
+            Email, Phone, Profession, PasswordHash, MustChangePassword
+        )
+        OUTPUT INSERTED.Id
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+    """, referrer_id, referral_code, first_name, middle_name, last_name,
+        email, phone, profession, password_hash)
+
+    return {
+        "id": cursor.fetchone()[0],
+        "referrerId": referrer_id,
+        "referralCode": referral_code,
+        "email": email,
+        "firstName": first_name,
+        "middleName": middle_name,
+        "lastName": last_name,
+        "phone": phone,
+        "profession": profession,
+        "ghlContactId": "",
+        "created": True,
+    }
+
+
+def notify_referrer_via_ghl(referrer, client_name):
+    """Upsert the referrer contact and trigger the configured GHL email tags."""
+    try:
+        token = os.getenv("GHL_ACCESS_TOKEN", "").strip()
+        location_id = os.getenv("GHL_LOCATION_ID", "").strip()
+        api_base = os.getenv(
+            "GHL_API_BASE", "https://services.leadconnectorhq.com"
+        ).rstrip("/")
+        if not token or not location_id or not referrer.get("email"):
+            return {"success": False, "skipped": True, "message": "GHL referrer notification is not configured."}
+
+        # Referrer fields may have been added in GHL after this Function App
+        # instance started. Refresh the map so credentials are never omitted
+        # because of a stale in-memory custom-field cache.
+        field_map = get_ghl_custom_field_map(
+            api_base,
+            location_id,
+            force_refresh=True,
+        )
+        custom_fields = []
+        add_ghl_field(custom_fields, "GHL_REFERRER_ID_FIELD", referrer["referrerId"], field_map)
+        add_ghl_field(custom_fields, "GHL_REFERRER_CODE_FIELD", referrer["referralCode"], field_map)
+        add_ghl_field(custom_fields, "GHL_REFERRED_CLIENT_NAME_FIELD", client_name, field_map)
+
+        # Only use a non-triggering classification tag during the upsert.
+        # Trigger tags are applied after GHL confirms the custom fields were
+        # saved. Adding them in this payload can start the workflows before
+        # the RF ID/referral code/client name are available and can also cause
+        # duplicate emails when retrigger_ghl_tag runs below.
+        tags = ["SBR Referrer"]
+        workflow_tags = [GHL_REFERRAL_SUBMITTED_TAG]
+        if referrer.get("created"):
+            workflow_tags.append(GHL_REFERRER_ACCOUNT_CREATED_TAG)
+
+        payload = {
+            "locationId": location_id,
+            "firstName": referrer.get("firstName") or "",
+            "lastName": referrer.get("lastName") or "",
+            "name": " ".join(filter(None, [referrer.get("firstName"), referrer.get("middleName"), referrer.get("lastName")])),
+            "email": referrer["email"],
+            "phone": referrer.get("phone") or "",
+            "source": "SBR Referral Submission",
+            "tags": tags,
+        }
+        if custom_fields:
+            payload["customFields"] = custom_fields
+
+        response = requests.post(
+            f"{api_base}/contacts/upsert",
+            headers=get_ghl_headers(),
+            json=payload,
+            timeout=30,
+        )
+        body = response.json() if response.content else {}
+        contact_id = extract_ghl_contact_id({"body": body})
+        triggers = []
+        if contact_id and response.status_code in (200, 201):
+            # Allow GHL's contact update to become visible to workflow merge
+            # fields before the tag-based workflows are enrolled.
+            time.sleep(1)
+            triggers.append(retrigger_ghl_tag(contact_id, GHL_REFERRAL_SUBMITTED_TAG))
+            if referrer.get("created"):
+                triggers.append(retrigger_ghl_tag(contact_id, GHL_REFERRER_ACCOUNT_CREATED_TAG))
+
+        return {
+            "success": response.status_code in (200, 201),
+            "statusCode": response.status_code,
+            "contactId": contact_id,
+            "clientName": client_name,
+            "tags": tags,
+            "workflowTags": workflow_tags,
+            "customFieldsSent": len(custom_fields),
+            "triggers": triggers,
+            "body": body,
+        }
+    except Exception as exc:
+        logging.exception("Referrer GHL notification failed.")
+        return {"success": False, "message": str(exc)}
+
+
+def notify_co_borrower_via_ghl(co_borrower, client_name):
+    """Upsert a co-borrower contact and trigger their submission email."""
+    try:
+        token = os.getenv("GHL_ACCESS_TOKEN", "").strip()
+        location_id = os.getenv("GHL_LOCATION_ID", "").strip()
+        api_base = os.getenv(
+            "GHL_API_BASE", "https://services.leadconnectorhq.com"
+        ).rstrip("/")
+        email = clean_value(co_borrower.get("email")).lower()
+        if not token or not location_id or not email:
+            return {
+                "success": False,
+                "skipped": True,
+                "email": email,
+                "message": "GHL co-borrower notification is not configured or no email was supplied.",
+            }
+
+        field_map = get_ghl_custom_field_map(api_base, location_id)
+        custom_fields = []
+        add_ghl_field(
+            custom_fields,
+            "GHL_REFERRED_CLIENT_NAME_FIELD",
+            client_name,
+            field_map,
+        )
+        payload = {
+            "locationId": location_id,
+            "firstName": clean_value(co_borrower.get("firstName")),
+            "lastName": clean_value(co_borrower.get("lastName")),
+            "name": " ".join(filter(None, [
+                clean_value(co_borrower.get("firstName")),
+                clean_value(co_borrower.get("middleName")),
+                clean_value(co_borrower.get("lastName")),
+            ])),
+            "email": email,
+            "phone": clean_value(co_borrower.get("phone")),
+            "source": "SBR Co-Borrower Submission",
+            "tags": ["SBR Co-Borrower", GHL_COBORROWER_SUBMISSION_TAG],
+        }
+        if custom_fields:
+            payload["customFields"] = custom_fields
+
+        response = requests.post(
+            f"{api_base}/contacts/upsert",
+            headers=get_ghl_headers(),
+            json=payload,
+            timeout=30,
+        )
+        body = response.json() if response.content else {}
+        contact_id = extract_ghl_contact_id({"body": body})
+        trigger = (
+            retrigger_ghl_tag(contact_id, GHL_COBORROWER_SUBMISSION_TAG)
+            if contact_id and response.status_code in (200, 201)
+            else None
+        )
+        return {
+            "success": response.status_code in (200, 201),
+            "statusCode": response.status_code,
+            "contactId": contact_id,
+            "email": email,
+            "trigger": trigger,
+            "body": body,
+        }
+    except Exception as exc:
+        logging.exception("Co-borrower GHL notification failed.")
+        return {"success": False, "message": str(exc)}
+
+
+@app.route(
+    route="referrer-lookup",
+    auth_level=func.AuthLevel.ANONYMOUS,
+    methods=["GET", "OPTIONS"],
+)
+def referrer_lookup(req: func.HttpRequest) -> func.HttpResponse:
+    """Resolve a reusable public REF code without exposing the private RF ID."""
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    referral_code = clean_value(req.params.get("code")).upper()
+    if not referral_code.startswith("REF-"):
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": False,
+                "message": "A valid REF referral code is required.",
+            }),
+            status_code=400,
+            mimetype="application/json",
+        ))
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT TOP 1 ReferralCode, FirstName, MiddleName, LastName,
+                Email, Phone, Profession
+            FROM dbo.Referrers
+            WHERE ReferralCode = ? AND IsActive = 1
+        """, referral_code)
+        referrer = cursor.fetchone()
+
+        if not referrer:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "Referrer code not found.",
+                }),
+                status_code=404,
+                mimetype="application/json",
+            ))
+
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": True,
+                "referrer": {
+                    "referralCode": referrer.ReferralCode,
+                    "firstName": referrer.FirstName or "",
+                    "middleName": referrer.MiddleName or "",
+                    "lastName": referrer.LastName or "",
+                    "email": referrer.Email or "",
+                    "phone": referrer.Phone or "",
+                    "profession": referrer.Profession or "",
+                },
+            }),
+            status_code=200,
+            mimetype="application/json",
+        ))
+    except Exception as exc:
+        logging.exception("Referrer lookup failed.")
+        return add_cors(func.HttpResponse(
+            json.dumps({"success": False, "message": str(exc)}),
+            status_code=500,
+            mimetype="application/json",
+        ))
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 @app.route(route="uploadclient", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST", "OPTIONS"])
 def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
     if req.method == "OPTIONS":
@@ -2177,7 +2540,43 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
         lvr = get_optional_form_value(form, "lvr", "Lvr", "LVR")
         special_notes = get_form_value(form, "specialNotes", "SpecialNotes", "special_notes")
 
-        required_values = {
+        referrer_profession = get_form_value(
+            form, "referrerProfession", "ReferrerProfession", "referrer_profession"
+        )
+        unique_referrer_code = get_form_value(
+            form, "uniqueReferrerCode", "UniqueReferrerCode", "unique_referrer_code"
+        )
+        has_property = get_form_value(form, "hasProperty", "HasProperty", "has_property")
+        property_type = get_form_value(form, "propertyType", "PropertyType", "property_type")
+        has_multiple_properties = get_form_value(
+            form, "hasMultipleProperties", "HasMultipleProperties", "has_multiple_properties"
+        )
+        is_self_employed = get_form_value(
+            form, "isSelfEmployed", "IsSelfEmployed", "is_self_employed"
+        )
+        has_tax_return = get_form_value(form, "hasTaxReturn", "HasTaxReturn", "has_tax_return")
+        dpn_issues = get_form_value(form, "dpnIssues", "DpnIssues", "dpn_issues")
+        dpn_details = get_form_value(form, "dpnDetails", "DpnDetails", "dpn_details")
+        is_client_compliant = get_form_value(
+            form, "isClientCompliant", "IsClientCompliant", "is_client_compliant"
+        )
+        pain_point = get_form_value(form, "painPoint", "PainPoint", "pain_point")
+        heard_about_us = get_form_value(form, "heardAboutUs", "HeardAboutUs", "heard_about_us")
+        sbr_funding_account_manager = get_form_value(
+            form,
+            "sbrFundingAccountManager",
+            "SbrFundingAccountManager",
+            "sbr_funding_account_manager",
+        )
+
+        normalized_source = source.strip().lower().replace("_", "-").replace(" ", "-")
+        uses_simplified_intake = normalized_source in ("direct-client", "referral")
+        is_referral_intake = normalized_source == "referral"
+        is_direct_client_intake = normalized_source == "direct-client"
+
+        legacy_required_values = {
+            "firstName": first_name,
+            "lastName": last_name,
             "email": email,
             "phone": phone,
             "source": source,
@@ -2190,8 +2589,45 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
             "anticipatedSettlementDate": anticipated_settlement_date,
         }
 
+        simplified_required_values = {
+            "firstName": first_name,
+            "lastName": last_name,
+            "email": email,
+            "phone": phone,
+            "source": source,
+            "borrowerType": borrower_type,
+            "transactionType": transaction_type,
+            "withBorrowersGuarantors": with_borrowers_guarantors,
+            "clientNeedsObjectives": client_needs_objectives,
+            "hasProperty": has_property,
+            "isSelfEmployed": is_self_employed,
+            "hasTaxReturn": has_tax_return,
+        }
+
+        if is_referral_intake:
+            simplified_required_values.update({
+                "referrerProfession": referrer_profession,
+                "dpnIssues": dpn_issues,
+                "isClientCompliant": is_client_compliant,
+            })
+        elif is_direct_client_intake:
+            simplified_required_values["heardAboutUs"] = heard_about_us
+
+        if uses_simplified_intake and has_property.strip().lower() == "yes":
+            simplified_required_values["propertyType"] = property_type
+
+        required_values = (
+            simplified_required_values if uses_simplified_intake else legacy_required_values
+        )
+        required_labels = {
+            **SIMPLIFIED_INTAKE_FIELDS,
+            **REFERRAL_INTAKE_FIELDS,
+            "heardAboutUs": "How you heard about us",
+            "propertyType": "Property type",
+        } if uses_simplified_intake else REQUIRED_INTAKE_FIELDS
+
         missing_required_fields = [
-            REQUIRED_INTAKE_FIELDS[field_name]
+            required_labels[field_name]
             for field_name, field_value in required_values.items()
             if not field_value
         ]
@@ -2277,9 +2713,34 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
             referrer_last_name = ""
             referrer_phone = ""
             referrer_email = ""
+            referrer_profession = ""
+            unique_referrer_code = ""
+
+        if not is_referral_intake:
+            dpn_issues = ""
+            dpn_details = ""
+            is_client_compliant = ""
+
+        if not is_direct_client_intake:
+            heard_about_us = ""
+            sbr_funding_account_manager = ""
 
         conn = get_sql_connection()
         cursor = conn.cursor()
+
+        referrer_account = None
+        if source.lower() != "direct-client" and referrer_email:
+            referrer_account = upsert_referrer_account(
+                cursor,
+                unique_referrer_code,
+                referrer_first_name,
+                referrer_middle_name,
+                referrer_last_name,
+                referrer_email,
+                referrer_phone,
+                referrer_profession,
+            )
+            unique_referrer_code = referrer_account["referralCode"]
 
         if existing_unique_id:
             cursor.execute("""
@@ -2475,6 +2936,47 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
 
             client_id = cursor.fetchone()[0]
 
+        cursor.execute("""
+            UPDATE Clients
+            SET
+                ReferrerProfession = ?,
+                UniqueReferrerCode = ?,
+                HasProperty = ?,
+                PropertyType = ?,
+                HasMultipleProperties = ?,
+                IsSelfEmployed = ?,
+                HasTaxReturn = ?,
+                DpnIssues = ?,
+                DpnDetails = ?,
+                IsClientCompliant = ?,
+                PainPoint = ?,
+                HeardAboutUs = ?,
+                SbrFundingAccountManager = ?
+            WHERE Id = ?
+        """, (
+            referrer_profession,
+            unique_referrer_code,
+            has_property,
+            property_type,
+            has_multiple_properties,
+            is_self_employed,
+            has_tax_return,
+            dpn_issues,
+            dpn_details,
+            is_client_compliant,
+            pain_point,
+            heard_about_us,
+            sbr_funding_account_manager,
+            client_id,
+        ))
+
+        if referrer_account:
+            cursor.execute("""
+                UPDATE Clients
+                SET ReferrerAccountId = ?, UniqueReferrerCode = ?
+                WHERE Id = ?
+            """, referrer_account["id"], unique_referrer_code, client_id)
+
         if co_borrowers_were_supplied:
             replace_client_co_borrowers(cursor, client_id, co_borrowers)
         else:
@@ -2608,6 +3110,46 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
             missing_documents=document_status["missingDocuments"],
         )
 
+        referrer_notification = {
+            "success": False,
+            "skipped": True,
+            "message": "No referrer account is linked to this submission.",
+        }
+        if is_initial_submission and referrer_account:
+            client_name = " ".join(filter(None, [first_name, middle_name, last_name]))
+            referrer_notification = notify_referrer_via_ghl(
+                referrer_account,
+                client_name,
+            )
+            referrer_contact_id = clean_value(
+                referrer_notification.get("contactId")
+                if isinstance(referrer_notification, dict)
+                else ""
+            )
+            if referrer_contact_id:
+                try:
+                    ref_conn = get_sql_connection()
+                    ref_cursor = ref_conn.cursor()
+                    ref_cursor.execute(
+                        "UPDATE dbo.Referrers SET GHLContactId = ?, UpdatedAt = SYSUTCDATETIME() WHERE Id = ?",
+                        referrer_contact_id,
+                        referrer_account["id"],
+                    )
+                    ref_conn.commit()
+                    ref_cursor.close()
+                    ref_conn.close()
+                except Exception:
+                    logging.exception("Failed to save the referrer GHL contact ID.")
+
+        co_borrower_notifications = []
+        if is_initial_submission and co_borrowers:
+            client_name = " ".join(filter(None, [first_name, middle_name, last_name]))
+            co_borrower_notifications = [
+                notify_co_borrower_via_ghl(co_borrower, client_name)
+                for co_borrower in co_borrowers
+                if clean_value(co_borrower.get("email"))
+            ]
+
         ghl_contact_id = extract_ghl_contact_id(ghl_sync)
         ghl_submission_trigger = {
             "success": False,
@@ -2661,6 +3203,18 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
                 "leadType": format_lead_type(lead_type),
                 "source": format_lead_type(source),
                 "status": "Pending Team Call",
+                "referrerAccount": (
+                    {
+                        "created": referrer_account["created"],
+                        "referrerId": referrer_account["referrerId"],
+                        "referralCode": referrer_account["referralCode"],
+                        "email": referrer_account["email"],
+                    }
+                    if referrer_account
+                    else None
+                ),
+                "referrerNotification": referrer_notification,
+                "coBorrowerNotifications": co_borrower_notifications,
                 "intake": {
                     "classificationType": classification_type,
                     "borrowerType": borrower_type,
@@ -4102,6 +4656,21 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
                 c.ReferrerLastName,
                 c.ReferrerPhone,
                 c.ReferrerEmail,
+                c.ReferrerProfession,
+                c.UniqueReferrerCode,
+                r.ReferrerId AS LinkedReferrerId,
+                r.ReferralCode AS LinkedReferralCode,
+                c.HasProperty,
+                c.PropertyType,
+                c.HasMultipleProperties,
+                c.IsSelfEmployed,
+                c.HasTaxReturn,
+                c.DpnIssues,
+                c.DpnDetails,
+                c.IsClientCompliant,
+                c.PainPoint,
+                c.HeardAboutUs,
+                c.SbrFundingAccountManager,
                 d.Id AS DocumentId,
                 d.DocumentType,
                 d.FileName,
@@ -4128,6 +4697,7 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
                 ) AS LatestMessageAt
             FROM Clients c
             LEFT JOIN Documents d ON d.ClientId = c.Id
+            LEFT JOIN dbo.Referrers r ON r.Id = c.ReferrerAccountId
             WHERE 1 = 1
         """
 
@@ -4163,6 +4733,15 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
                     OR c.ApplicantBackground LIKE ?
                     OR c.ExplanationOfIncome LIKE ?
                     OR c.Security LIKE ?
+                    OR c.ReferrerProfession LIKE ?
+                    OR c.UniqueReferrerCode LIKE ?
+                    OR r.ReferrerId LIKE ?
+                    OR r.ReferralCode LIKE ?
+                    OR c.PropertyType LIKE ?
+                    OR c.DpnDetails LIKE ?
+                    OR c.PainPoint LIKE ?
+                    OR c.HeardAboutUs LIKE ?
+                    OR c.SbrFundingAccountManager LIKE ?
                     OR CAST(c.LoanAmount AS NVARCHAR(50)) LIKE ?
                     OR CAST(c.SecurityValue AS NVARCHAR(50)) LIKE ?
                     OR CAST(c.Lvr AS NVARCHAR(50)) LIKE ?
@@ -4178,6 +4757,8 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
                 like, like, like, like, like,
                 like, like, like, like, like,
                 like, like, like, like, like,
+                like, like, like, like, like,
+                like, like, like, like,
             ])
 
         query += " ORDER BY COALESCE(d.UploadedAt, '1900-01-01') DESC, c.Id DESC"
@@ -4242,7 +4823,24 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
                     "lastName": row.ReferrerLastName,
                     "phone": row.ReferrerPhone,
                     "email": row.ReferrerEmail,
+                    "profession": row.ReferrerProfession,
+                    "uniqueCode": row.UniqueReferrerCode,
                 },
+                "referrerProfession": row.ReferrerProfession,
+                "uniqueReferrerCode": row.UniqueReferrerCode,
+                "referrerId": row.LinkedReferrerId,
+                "referralCode": row.LinkedReferralCode or row.UniqueReferrerCode,
+                "hasProperty": row.HasProperty,
+                "propertyType": row.PropertyType,
+                "hasMultipleProperties": row.HasMultipleProperties,
+                "isSelfEmployed": row.IsSelfEmployed,
+                "hasTaxReturn": row.HasTaxReturn,
+                "dpnIssues": row.DpnIssues,
+                "dpnDetails": row.DpnDetails,
+                "isClientCompliant": row.IsClientCompliant,
+                "painPoint": row.PainPoint,
+                "heardAboutUs": row.HeardAboutUs,
+                "sbrFundingAccountManager": row.SbrFundingAccountManager,
                 "documentType": row.DocumentType,
                 "fileName": row.FileName,
                 "fileUrl": row.BlobUrl,
@@ -4536,6 +5134,13 @@ def client_change_password(req: func.HttpRequest) -> func.HttpResponse:
         current_password = data.get("currentPassword") or ""
         new_password = data.get("newPassword") or ""
 
+        if unique_id and not unique_id.upper().startswith("CL-"):
+            return add_cors(func.HttpResponse(
+                json.dumps({"success": False, "message": "Client password changes accept CL Client IDs only."}),
+                status_code=400,
+                mimetype="application/json",
+            ))
+
         if not unique_id or not current_password or not new_password:
             return add_cors(func.HttpResponse(
                 json.dumps({
@@ -4723,6 +5328,355 @@ def client_change_password(req: func.HttpRequest) -> func.HttpResponse:
 
 
 @app.route(
+    route="referrers",
+    auth_level=func.AuthLevel.ANONYMOUS,
+    methods=["GET", "OPTIONS"],
+)
+def get_referrers(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    search = clean_value(req.params.get("search"))
+    conn = None
+    cursor = None
+    try:
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        query = """
+            SELECT
+                r.Id AS ReferrerAccountId,
+                r.ReferrerId,
+                r.ReferralCode,
+                r.FirstName,
+                r.MiddleName,
+                r.LastName,
+                r.Email,
+                r.Phone,
+                r.Profession,
+                r.IsActive,
+                r.CreatedAt,
+                c.Id AS ClientId,
+                c.UniqueId AS ClientUniqueId,
+                c.FirstName AS ClientFirstName,
+                c.MiddleName AS ClientMiddleName,
+                c.LastName AS ClientLastName,
+                c.Status AS ClientStatus,
+                COALESCE(document_counts.UploadedDocumentCount, 0)
+                    AS UploadedDocumentCount,
+                COALESCE(document_counts.WaivedDocumentCount, 0)
+                    AS WaivedDocumentCount,
+                COALESCE(document_counts.DocumentCount, 0)
+                    AS DocumentCount
+            FROM dbo.Referrers r
+            LEFT JOIN dbo.Clients c ON c.ReferrerAccountId = r.Id
+            OUTER APPLY (
+                SELECT
+                    (
+                        SELECT COUNT(DISTINCT uploaded.DocumentType)
+                        FROM dbo.Documents uploaded
+                        WHERE uploaded.ClientId = c.Id
+                    ) AS UploadedDocumentCount,
+                    (
+                        SELECT COUNT(DISTINCT waived.DocumentType)
+                        FROM dbo.DocumentWaivers waived
+                        WHERE waived.ClientId = c.Id
+                    ) AS WaivedDocumentCount,
+                    (
+                        SELECT COUNT(*)
+                        FROM (
+                            SELECT uploaded.DocumentType
+                            FROM dbo.Documents uploaded
+                            WHERE uploaded.ClientId = c.Id
+
+                            UNION
+
+                            SELECT waived.DocumentType
+                            FROM dbo.DocumentWaivers waived
+                            WHERE waived.ClientId = c.Id
+                        ) submitted_or_waived
+                    ) AS DocumentCount
+            ) document_counts
+            WHERE 1 = 1
+        """
+        params = []
+        if search:
+            query += """
+                AND (
+                    r.ReferrerId LIKE ? OR r.ReferralCode LIKE ?
+                    OR r.FirstName LIKE ? OR r.MiddleName LIKE ?
+                    OR r.LastName LIKE ? OR r.Email LIKE ?
+                    OR r.Phone LIKE ? OR r.Profession LIKE ?
+                    OR c.UniqueId LIKE ? OR c.FirstName LIKE ?
+                    OR c.MiddleName LIKE ? OR c.LastName LIKE ?
+                )
+            """
+            like = f"%{search}%"
+            params.extend([like] * 12)
+
+        query += """
+            ORDER BY r.CreatedAt DESC, r.Id DESC, c.Id DESC
+        """
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        referrers_by_id = {}
+        for row in rows:
+            referrer = referrers_by_id.setdefault(row.ReferrerAccountId, {
+                "id": row.ReferrerAccountId,
+                "referrerId": row.ReferrerId,
+                "referralCode": row.ReferralCode,
+                "firstName": row.FirstName or "",
+                "middleName": row.MiddleName or "",
+                "lastName": row.LastName or "",
+                "name": " ".join(filter(None, [
+                    row.FirstName, row.MiddleName, row.LastName,
+                ])),
+                "email": row.Email or "",
+                "phone": row.Phone or "",
+                "profession": row.Profession or "",
+                "isActive": bool(row.IsActive),
+                "createdAt": str(row.CreatedAt) if row.CreatedAt else None,
+                "referredClients": [],
+            })
+            if row.ClientId:
+                referrer["referredClients"].append({
+                    "clientId": row.ClientId,
+                    "uniqueId": row.ClientUniqueId,
+                    "name": " ".join(filter(None, [
+                        row.ClientFirstName,
+                        row.ClientMiddleName,
+                        row.ClientLastName,
+                    ])),
+                    "status": row.ClientStatus or "Pending Team Call",
+                    "uploadedDocumentCount": int(
+                        row.UploadedDocumentCount or 0
+                    ),
+                    "waivedDocumentCount": int(
+                        row.WaivedDocumentCount or 0
+                    ),
+                    "documentCount": int(row.DocumentCount or 0),
+                })
+
+        referrers = list(referrers_by_id.values())
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": True,
+                "referrers": referrers,
+                "total": len(referrers),
+            }),
+            status_code=200,
+            mimetype="application/json",
+        ))
+    except Exception as exc:
+        logging.exception("Get referrers failed.")
+        return add_cors(func.HttpResponse(
+            json.dumps({"success": False, "message": str(exc)}),
+            status_code=500,
+            mimetype="application/json",
+        ))
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+@app.route(
+    route="referrer-login",
+    auth_level=func.AuthLevel.ANONYMOUS,
+    methods=["POST", "OPTIONS"],
+)
+def referrer_login(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    try:
+        data = req.get_json()
+        referrer_id = clean_value(data.get("referrerId") or data.get("uniqueId")).upper()
+        password = data.get("password") or ""
+        if not referrer_id.startswith("RF-") or not password:
+            return add_cors(func.HttpResponse(json.dumps({
+                "success": False,
+                "message": "A valid RF Referrer ID and password are required.",
+            }), status_code=400, mimetype="application/json"))
+
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT TOP 1 Id, ReferrerId, ReferralCode, FirstName, MiddleName,
+                LastName, Email, Phone, Profession, PasswordHash,
+                COALESCE(MustChangePassword, 1) AS MustChangePassword,
+                PasswordChangedDate
+            FROM dbo.Referrers
+            WHERE ReferrerId = ? AND IsActive = 1
+        """, referrer_id)
+        referrer = cursor.fetchone()
+
+        if not referrer or not verify_client_password(password, clean_value(referrer.PasswordHash)):
+            cursor.close()
+            conn.close()
+            return add_cors(func.HttpResponse(json.dumps({
+                "success": False,
+                "message": "Invalid Referrer ID or password.",
+            }), status_code=401, mimetype="application/json"))
+
+        cursor.execute("""
+            SELECT
+                c.Id AS ClientId,
+                c.UniqueId,
+                c.FirstName,
+                c.MiddleName,
+                c.LastName,
+                c.Status AS ClientStatus,
+                d.Id AS DocumentId,
+                d.DocumentType,
+                d.FileName,
+                d.UploadedAt,
+                COALESCE(d.Status, 'Pending') AS DocumentStatus
+            FROM dbo.Clients c
+            LEFT JOIN dbo.Documents d ON d.ClientId = c.Id
+            WHERE c.ReferrerAccountId = ?
+            ORDER BY c.Id DESC, d.UploadedAt DESC, d.Id DESC
+        """, referrer.Id)
+        referral_rows = cursor.fetchall()
+        referred_clients_by_id = {}
+        for row in referral_rows:
+            client = referred_clients_by_id.setdefault(row.ClientId, {
+                "clientId": row.ClientId,
+                "uniqueId": row.UniqueId,
+                "name": " ".join(filter(None, [
+                    row.FirstName,
+                    row.MiddleName,
+                    row.LastName,
+                ])),
+                "status": row.ClientStatus or "Pending Team Call",
+                "documents": [],
+                "waivedDocuments": [],
+            })
+            if row.DocumentId:
+                client["documents"].append({
+                    "id": row.DocumentId,
+                    "documentType": row.DocumentType,
+                    "documentLabel": format_document_type(row.DocumentType),
+                    "fileName": row.FileName,
+                    "uploadedAt": str(row.UploadedAt) if row.UploadedAt else None,
+                    "status": row.DocumentStatus,
+                })
+
+        cursor.execute("""
+            SELECT
+                w.ClientId,
+                w.DocumentType,
+                w.WaivedAt
+            FROM dbo.DocumentWaivers w
+            INNER JOIN dbo.Clients c ON c.Id = w.ClientId
+            WHERE c.ReferrerAccountId = ?
+            ORDER BY w.ClientId DESC, w.WaivedAt DESC, w.Id DESC
+        """, referrer.Id)
+        for row in cursor.fetchall():
+            client = referred_clients_by_id.get(row.ClientId)
+            if not client:
+                continue
+            client["waivedDocuments"].append({
+                "documentType": row.DocumentType,
+                "documentLabel": format_document_type(row.DocumentType),
+                "waivedAt": str(row.WaivedAt) if row.WaivedAt else None,
+                "status": "Waived",
+            })
+
+        payload = {
+            "id": referrer.Id,
+            "role": "referrer",
+            "uniqueId": referrer.ReferrerId,
+            "referrerId": referrer.ReferrerId,
+            "referralCode": referrer.ReferralCode,
+            "firstName": referrer.FirstName,
+            "middleName": referrer.MiddleName,
+            "lastName": referrer.LastName,
+            "email": referrer.Email,
+            "phone": referrer.Phone,
+            "profession": referrer.Profession,
+            "mustChangePassword": bool(referrer.MustChangePassword),
+            "referredClients": list(referred_clients_by_id.values()),
+        }
+        cursor.close()
+        conn.close()
+        return add_cors(func.HttpResponse(json.dumps({
+            "success": True,
+            "referrer": payload,
+            "mustChangePassword": payload["mustChangePassword"],
+        }), status_code=200, mimetype="application/json"))
+    except Exception as exc:
+        logging.exception("Referrer login failed.")
+        return add_cors(func.HttpResponse(json.dumps({
+            "success": False, "message": str(exc)
+        }), status_code=500, mimetype="application/json"))
+
+
+@app.route(
+    route="referrer-change-password",
+    auth_level=func.AuthLevel.ANONYMOUS,
+    methods=["POST", "OPTIONS"],
+)
+def referrer_change_password(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    try:
+        data = req.get_json()
+        referrer_id = clean_value(data.get("referrerId") or data.get("uniqueId")).upper()
+        current_password = data.get("currentPassword") or ""
+        new_password = data.get("newPassword") or ""
+        errors = validate_new_password(new_password)
+        if not referrer_id.startswith("RF-") or not current_password or errors:
+            return add_cors(func.HttpResponse(json.dumps({
+                "success": False,
+                "message": errors[0] if errors else "Referrer ID and both passwords are required.",
+                "errors": errors,
+            }), status_code=400, mimetype="application/json"))
+
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT TOP 1 Id, PasswordHash FROM dbo.Referrers
+            WHERE ReferrerId = ? AND IsActive = 1
+        """, referrer_id)
+        referrer = cursor.fetchone()
+        if not referrer or not verify_client_password(current_password, clean_value(referrer.PasswordHash)):
+            cursor.close()
+            conn.close()
+            return add_cors(func.HttpResponse(json.dumps({
+                "success": False, "message": "The current password is incorrect."
+            }), status_code=401, mimetype="application/json"))
+
+        changed_at = datetime.utcnow()
+        cursor.execute("""
+            UPDATE dbo.Referrers
+            SET PasswordHash = ?, MustChangePassword = 0,
+                PasswordChangedDate = ?, UpdatedAt = SYSUTCDATETIME()
+            WHERE Id = ?
+        """, hash_client_password(new_password), changed_at, referrer.Id)
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return add_cors(func.HttpResponse(json.dumps({
+            "success": True,
+            "message": "Password changed successfully.",
+            "mustChangePassword": False,
+        }), status_code=200, mimetype="application/json"))
+    except Exception as exc:
+        logging.exception("Referrer password change failed.")
+        return add_cors(func.HttpResponse(json.dumps({
+            "success": False, "message": str(exc)
+        }), status_code=500, mimetype="application/json"))
+
+
+@app.route(
     route="client-login",
     auth_level=func.AuthLevel.ANONYMOUS,
     methods=["POST", "OPTIONS"],
@@ -4739,6 +5693,13 @@ def client_login(req: func.HttpRequest) -> func.HttpResponse:
 
         unique_id = clean_value(data.get("uniqueId"))
         password = data.get("password") or ""
+
+        if unique_id and not unique_id.upper().startswith("CL-"):
+            return add_cors(func.HttpResponse(
+                json.dumps({"success": False, "message": "Client login accepts CL Client IDs only."}),
+                status_code=400,
+                mimetype="application/json",
+            ))
 
         if not unique_id or not password:
             return add_cors(func.HttpResponse(
@@ -4787,6 +5748,19 @@ def client_login(req: func.HttpRequest) -> func.HttpResponse:
                 ReferrerLastName,
                 ReferrerPhone,
                 ReferrerEmail,
+                ReferrerProfession,
+                UniqueReferrerCode,
+                HasProperty,
+                PropertyType,
+                HasMultipleProperties,
+                IsSelfEmployed,
+                HasTaxReturn,
+                DpnIssues,
+                DpnDetails,
+                IsClientCompliant,
+                PainPoint,
+                HeardAboutUs,
+                SbrFundingAccountManager,
                 Progress,
                 CompletedDate,
                 ReminderSent,
@@ -4883,7 +5857,22 @@ def client_login(req: func.HttpRequest) -> func.HttpResponse:
                 "lastName": client.ReferrerLastName,
                 "phone": client.ReferrerPhone,
                 "email": client.ReferrerEmail,
+                "profession": client.ReferrerProfession,
+                "uniqueCode": client.UniqueReferrerCode,
             },
+            "referrerProfession": client.ReferrerProfession,
+            "uniqueReferrerCode": client.UniqueReferrerCode,
+            "hasProperty": client.HasProperty,
+            "propertyType": client.PropertyType,
+            "hasMultipleProperties": client.HasMultipleProperties,
+            "isSelfEmployed": client.IsSelfEmployed,
+            "hasTaxReturn": client.HasTaxReturn,
+            "dpnIssues": client.DpnIssues,
+            "dpnDetails": client.DpnDetails,
+            "isClientCompliant": client.IsClientCompliant,
+            "painPoint": client.PainPoint,
+            "heardAboutUs": client.HeardAboutUs,
+            "sbrFundingAccountManager": client.SbrFundingAccountManager,
             "progress": client.Progress,
             "completedDate": (
                 str(client.CompletedDate)
