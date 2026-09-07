@@ -274,6 +274,161 @@ def get_sql_connection():
     return pyodbc.connect(conn_str)
 
 
+def ensure_admin_notifications_table(cursor):
+    """Create the shared admin notification store on older databases as needed."""
+    cursor.execute("""
+        IF OBJECT_ID('dbo.AdminNotifications', 'U') IS NULL
+        BEGIN
+            CREATE TABLE dbo.AdminNotifications (
+                Id BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+                ClientId INT NULL,
+                UniqueId NVARCHAR(100) NULL,
+                ClientName NVARCHAR(300) NULL,
+                Title NVARCHAR(200) NOT NULL,
+                Message NVARCHAR(1000) NOT NULL,
+                NotificationType NVARCHAR(50) NOT NULL,
+                DocumentType NVARCHAR(200) NULL,
+                Source NVARCHAR(100) NULL,
+                RedirectTo NVARCHAR(500) NULL,
+                IsRead BIT NOT NULL CONSTRAINT DF_AdminNotifications_IsRead DEFAULT (0),
+                CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_AdminNotifications_CreatedAt DEFAULT (SYSUTCDATETIME())
+            );
+
+            CREATE INDEX IX_AdminNotifications_CreatedAt
+                ON dbo.AdminNotifications (CreatedAt DESC);
+        END
+    """)
+    cursor.execute("""
+        IF COL_LENGTH('dbo.AdminNotifications', 'DocumentId') IS NULL
+            ALTER TABLE dbo.AdminNotifications ADD DocumentId INT NULL
+    """)
+
+
+def create_admin_notification(
+    cursor, *, client_id, unique_id, client_name, title, message,
+    notification_type, document_type="", source="", document_id=None
+):
+    ensure_admin_notifications_table(cursor)
+    redirect_to = (
+        "/dashboard/client-search?"
+        f"clientId={quote(str(client_id))}&uniqueId={quote(unique_id or '')}"
+    )
+    cursor.execute("""
+        INSERT INTO AdminNotifications (
+            ClientId, UniqueId, ClientName, Title, Message,
+            NotificationType, DocumentType, Source, RedirectTo, IsRead, DocumentId
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+    """, (
+        client_id, unique_id, client_name, title, message,
+        notification_type, document_type or None, source or None, redirect_to,
+        document_id,
+    ))
+
+
+def reconcile_client_submission_notifications(cursor):
+    """Capture clients written by another/older API instance sharing this DB."""
+    ensure_admin_notifications_table(cursor)
+    cursor.execute("""
+        INSERT INTO AdminNotifications (
+            ClientId, UniqueId, ClientName, Title, Message,
+            NotificationType, DocumentType, Source, RedirectTo, IsRead
+        )
+        SELECT
+            c.Id,
+            c.UniqueId,
+            LTRIM(RTRIM(CONCAT(
+                COALESCE(c.FirstName, ''), ' ',
+                COALESCE(c.MiddleName, ''), ' ',
+                COALESCE(c.LastName, '')
+            ))),
+            'New Client Submission',
+            CONCAT(
+                LTRIM(RTRIM(CONCAT(
+                    COALESCE(c.FirstName, ''), ' ',
+                    COALESCE(c.MiddleName, ''), ' ',
+                    COALESCE(c.LastName, '')
+                ))),
+                ' submitted a new client application.'
+            ),
+            'client',
+            NULL,
+            COALESCE(NULLIF(c.Source, ''), NULLIF(c.LeadType, '')),
+            CONCAT(
+                '/dashboard/client-search?clientId=', c.Id,
+                '&uniqueId=', COALESCE(c.UniqueId, '')
+            ),
+            0
+        FROM Clients c
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM AdminNotifications n
+            WHERE n.ClientId = c.Id
+              AND n.NotificationType = 'client'
+        )
+    """)
+
+
+def reconcile_client_document_notifications(cursor):
+    """Capture client files saved by another/older API instance."""
+    ensure_admin_notifications_table(cursor)
+    cursor.execute("""
+        INSERT INTO AdminNotifications (
+            ClientId, UniqueId, ClientName, Title, Message,
+            NotificationType, DocumentType, Source, RedirectTo, IsRead,
+            DocumentId
+        )
+        SELECT
+            c.Id,
+            c.UniqueId,
+            LTRIM(RTRIM(CONCAT(
+                COALESCE(c.FirstName, ''), ' ',
+                COALESCE(c.MiddleName, ''), ' ',
+                COALESCE(c.LastName, '')
+            ))),
+            'New Document Upload',
+            CONCAT(
+                LTRIM(RTRIM(CONCAT(
+                    COALESCE(c.FirstName, ''), ' ',
+                    COALESCE(c.MiddleName, ''), ' ',
+                    COALESCE(c.LastName, '')
+                ))),
+                ' uploaded ', COALESCE(NULLIF(d.DocumentType, ''), 'a document'),
+                ' (',
+                CASE
+                    WHEN LOWER(COALESCE(d.Remarks, d.VerifiedBy, '')) LIKE '%admin%'
+                        THEN 'Admin Upload'
+                    WHEN LOWER(COALESCE(d.Remarks, d.VerifiedBy, '')) LIKE '%referrer%'
+                        THEN 'Uploaded by Referrer'
+                    ELSE 'Uploaded by Client'
+                END,
+                ').'
+            ),
+            'file',
+            d.DocumentType,
+            CASE
+                WHEN LOWER(COALESCE(d.Remarks, d.VerifiedBy, '')) LIKE '%admin%'
+                    THEN 'Admin Portal'
+                WHEN LOWER(COALESCE(d.Remarks, d.VerifiedBy, '')) LIKE '%referrer%'
+                    THEN 'Referrer Portal'
+                ELSE 'Client Portal'
+            END,
+            CONCAT(
+                '/dashboard/client-search?clientId=', c.Id,
+                '&uniqueId=', COALESCE(c.UniqueId, '')
+            ),
+            0,
+            d.Id
+        FROM Documents d
+        INNER JOIN Clients c ON c.Id = d.ClientId
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM AdminNotifications n
+            WHERE n.DocumentId = d.Id
+        )
+    """)
+
+
 def clean_value(value):
     if not value:
         return ""
@@ -2455,6 +2610,8 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
 
         lead_type = clean_value(form.get("leadType") or form.get("source") or "Broker")
         source = clean_value(form.get("source") or lead_type or "Broker")
+        uploader_type = clean_value(form.get("uploaderType"))
+        upload_source = clean_value(form.get("uploadSource"))
 
         raw_document_type = get_form_value(
             form,
@@ -2465,6 +2622,7 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
         document_type = normalize_document_type(raw_document_type)
         uploaded_filename = uploaded_file.filename if uploaded_file else ""
         blob_url = ""
+        uploaded_document_id = None
 
         classification_type = get_form_value(form, "classificationType", "ClassificationType", "classification_type")
         borrower_type = get_form_value(form, "borrowerType", "BorrowerType", "borrower_type")
@@ -3044,6 +3202,7 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
                     VerifiedDate,
                     Remarks
                 )
+                OUTPUT INSERTED.Id
                 VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL)
             """, (
                 client_id,
@@ -3052,6 +3211,7 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
                 blob_url,
                 "Pending",
             ))
+            uploaded_document_id = cursor.fetchone()[0]
 
             cursor.execute("""
                 UPDATE Clients
@@ -3068,6 +3228,44 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
             ))
 
         document_status = update_client_workflow_status(cursor, client_id)
+
+        client_name = " ".join(
+            part for part in (first_name, middle_name, last_name) if part
+        ) or unique_id
+
+        if is_initial_submission:
+            submission_detail = (
+                f" and uploaded {format_document_type(document_type)}"
+                if uploaded_file and document_type
+                else ""
+            )
+            create_admin_notification(
+                cursor,
+                client_id=client_id,
+                unique_id=unique_id,
+                client_name=client_name,
+                title="New Client Submission",
+                message=f"{client_name} submitted a new client application{submission_detail}.",
+                notification_type="client",
+                document_type=document_type if uploaded_file else "",
+                source=source,
+                document_id=uploaded_document_id,
+            )
+        elif uploaded_file:
+            document_label = format_document_type(document_type) or "a document"
+            uploader_label = uploader_type or "Client"
+            create_admin_notification(
+                cursor,
+                client_id=client_id,
+                unique_id=unique_id,
+                client_name=client_name,
+                title="New Document Upload",
+                message=f"{client_name} uploaded {document_label} ({uploader_label} Upload).",
+                notification_type="file",
+                document_type=document_type,
+                source=upload_source or f"{uploader_label} Portal",
+                document_id=uploaded_document_id,
+            )
 
         conn.commit()
         cursor.close()
@@ -3272,6 +3470,140 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         ))
+
+
+@app.route(route="notifications", auth_level=func.AuthLevel.ANONYMOUS, methods=["GET", "OPTIONS"])
+def get_admin_notifications(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        ensure_admin_notifications_table(cursor)
+        reconcile_client_submission_notifications(cursor)
+        reconcile_client_document_notifications(cursor)
+        conn.commit()
+        cursor.execute("""
+            SELECT TOP 100
+                Id, ClientId, UniqueId, ClientName, Title, Message,
+                NotificationType, DocumentType, Source, RedirectTo,
+                IsRead, CreatedAt
+            FROM AdminNotifications
+            ORDER BY CreatedAt DESC, Id DESC
+        """)
+        notifications = []
+        for row in cursor.fetchall():
+            notifications.append({
+                "id": row.Id,
+                "clientId": row.ClientId,
+                "uniqueId": row.UniqueId or "",
+                "clientName": row.ClientName or "",
+                "title": row.Title,
+                "message": row.Message,
+                "type": row.NotificationType or "notice",
+                "documentType": format_document_type(row.DocumentType or ""),
+                "source": row.Source or "",
+                "redirectTo": row.RedirectTo or "/dashboard/client-search",
+                "unread": not bool(row.IsRead),
+                "createdAt": row.CreatedAt.isoformat() + "Z" if row.CreatedAt else None,
+            })
+        return add_cors(func.HttpResponse(
+            json.dumps({"success": True, "notifications": notifications}),
+            status_code=200,
+            mimetype="application/json",
+        ))
+    except Exception as exc:
+        logging.exception("Failed to load admin notifications.")
+        return add_cors(func.HttpResponse(
+            json.dumps({"success": False, "message": str(exc)}),
+            status_code=500,
+            mimetype="application/json",
+        ))
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+@app.route(route="notifications/{notification_id}", auth_level=func.AuthLevel.ANONYMOUS, methods=["PATCH", "OPTIONS"])
+def update_admin_notification(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    conn = None
+    cursor = None
+    try:
+        notification_id = int(req.route_params.get("notification_id"))
+        payload = req.get_json() if req.get_body() else {}
+        is_read = bool(payload.get("isRead", True))
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        ensure_admin_notifications_table(cursor)
+        cursor.execute(
+            "UPDATE AdminNotifications SET IsRead = ? WHERE Id = ?",
+            is_read,
+            notification_id,
+        )
+        conn.commit()
+        return add_cors(func.HttpResponse(
+            json.dumps({"success": True}),
+            status_code=200,
+            mimetype="application/json",
+        ))
+    except (TypeError, ValueError):
+        return add_cors(func.HttpResponse(
+            json.dumps({"success": False, "message": "Invalid notification id."}),
+            status_code=400,
+            mimetype="application/json",
+        ))
+    except Exception as exc:
+        logging.exception("Failed to update admin notification.")
+        return add_cors(func.HttpResponse(
+            json.dumps({"success": False, "message": str(exc)}),
+            status_code=500,
+            mimetype="application/json",
+        ))
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+@app.route(route="notifications/mark-all-read", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST", "OPTIONS"])
+def mark_all_admin_notifications_read(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        ensure_admin_notifications_table(cursor)
+        cursor.execute("UPDATE AdminNotifications SET IsRead = 1 WHERE IsRead = 0")
+        conn.commit()
+        return add_cors(func.HttpResponse(
+            json.dumps({"success": True}),
+            status_code=200,
+            mimetype="application/json",
+        ))
+    except Exception as exc:
+        logging.exception("Failed to mark admin notifications as read.")
+        return add_cors(func.HttpResponse(
+            json.dumps({"success": False, "message": str(exc)}),
+            status_code=500,
+            mimetype="application/json",
+        ))
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
 
 
 @app.route(route="documents", auth_level=func.AuthLevel.ANONYMOUS, methods=["GET", "OPTIONS"])
