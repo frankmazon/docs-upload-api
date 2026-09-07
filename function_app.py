@@ -4876,6 +4876,247 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
         ))
 
 
+@app.route(
+    route="clients/{client_id}",
+    auth_level=func.AuthLevel.ANONYMOUS,
+    methods=["PATCH", "OPTIONS"],
+)
+def update_client(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    conn = None
+    cursor = None
+
+    try:
+        client_id_text = clean_value(req.route_params.get("client_id"))
+        if not client_id_text.isdigit() or int(client_id_text) <= 0:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "A valid client ID is required.",
+                }),
+                status_code=400,
+                mimetype="application/json",
+            ))
+
+        try:
+            data = req.get_json()
+        except ValueError:
+            data = None
+
+        if not isinstance(data, dict):
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "A JSON object containing the changes is required.",
+                }),
+                status_code=400,
+                mimetype="application/json",
+            ))
+
+        editable_columns = {
+            "classificationType": "ClassificationType",
+            "borrowerType": "BorrowerType",
+            "objective": "Objective",
+            "loanType": "LoanType",
+            "purpose": "Purpose",
+            "transactionType": "TransactionType",
+            "withBorrowersGuarantors": "WithBorrowersGuarantors",
+            "anticipatedSettlementDate": "AnticipatedSettlementDate",
+            "vedaIssues": "VedaIssues",
+            "conductIssues": "ConductIssues",
+            "clientNeedsObjectives": "ClientNeedsObjectives",
+            "applicantBackground": "ApplicantBackground",
+            "explanationOfIncome": "ExplanationOfIncome",
+            "security": "Security",
+            "loanAmount": "LoanAmount",
+            "securityValue": "SecurityValue",
+            "lvr": "Lvr",
+            "specialNotes": "SpecialNotes",
+            "status": "Status",
+            "assignedSpecialist": "AssignedSpecialist",
+        }
+        numeric_fields = {"loanAmount", "securityValue", "lvr"}
+        date_fields = {"anticipatedSettlementDate"}
+
+        assignments = []
+        values = []
+        updated_fields = []
+
+        for field_name, column_name in editable_columns.items():
+            if field_name not in data:
+                continue
+
+            raw_value = data.get(field_name)
+
+            if field_name in numeric_fields:
+                value_text = clean_value(raw_value).replace(",", "")
+                if not value_text:
+                    value = None
+                else:
+                    try:
+                        value = float(value_text)
+                    except (TypeError, ValueError):
+                        return add_cors(func.HttpResponse(
+                            json.dumps({
+                                "success": False,
+                                "message": f"{field_name} must be a valid number.",
+                            }),
+                            status_code=400,
+                            mimetype="application/json",
+                        ))
+            elif field_name in date_fields:
+                value_text = clean_value(raw_value)
+                if not value_text:
+                    value = None
+                else:
+                    try:
+                        value = datetime.strptime(
+                            value_text[:10],
+                            "%Y-%m-%d",
+                        ).date()
+                    except ValueError:
+                        return add_cors(func.HttpResponse(
+                            json.dumps({
+                                "success": False,
+                                "message": (
+                                    "anticipatedSettlementDate must use "
+                                    "YYYY-MM-DD format."
+                                ),
+                            }),
+                            status_code=400,
+                            mimetype="application/json",
+                        ))
+            else:
+                value = clean_value(raw_value)
+
+            assignments.append(f"{column_name} = ?")
+            values.append(value)
+            updated_fields.append(field_name)
+
+        if not assignments:
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "No supported client fields were supplied.",
+                }),
+                status_code=400,
+                mimetype="application/json",
+            ))
+
+        client_id = int(client_id_text)
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT TOP 1 Id FROM Clients WHERE Id = ?",
+            client_id,
+        )
+        if not cursor.fetchone():
+            return add_cors(func.HttpResponse(
+                json.dumps({
+                    "success": False,
+                    "message": "Client not found.",
+                }),
+                status_code=404,
+                mimetype="application/json",
+            ))
+
+        values.append(client_id)
+        cursor.execute(
+            f"UPDATE Clients SET {', '.join(assignments)} WHERE Id = ?",
+            values,
+        )
+        conn.commit()
+
+        cursor.execute("""
+            SELECT TOP 1
+                UniqueId, FirstName, MiddleName, LastName, Email, Phone,
+                LeadType, Source, ClassificationType, BorrowerType,
+                Objective, LoanType, Purpose, TransactionType,
+                WithBorrowersGuarantors, AnticipatedSettlementDate,
+                ReferrerFirstName, ReferrerMiddleName, ReferrerLastName,
+                ReferrerPhone, ReferrerEmail
+            FROM Clients
+            WHERE Id = ?
+        """, client_id)
+        client = cursor.fetchone()
+        document_status = get_client_document_status(cursor, client_id)
+
+        ghl_sync = sync_client_to_ghl(
+            unique_id=client.UniqueId,
+            first_name=client.FirstName,
+            middle_name=client.MiddleName,
+            last_name=client.LastName,
+            email=client.Email,
+            phone=client.Phone,
+            lead_type=client.LeadType,
+            source=client.Source,
+            classification_type=client.ClassificationType,
+            borrower_type=client.BorrowerType,
+            objective=client.Objective,
+            loan_type=client.LoanType,
+            purpose=client.Purpose,
+            transaction_type=client.TransactionType,
+            with_borrowers_guarantors=client.WithBorrowersGuarantors,
+            anticipated_settlement_date=(
+                str(client.AnticipatedSettlementDate)
+                if client.AnticipatedSettlementDate
+                else ""
+            ),
+            referrer_first_name=client.ReferrerFirstName,
+            referrer_middle_name=client.ReferrerMiddleName,
+            referrer_last_name=client.ReferrerLastName,
+            referrer_phone=client.ReferrerPhone,
+            referrer_email=client.ReferrerEmail,
+            uploaded_documents=document_status["uploadedDocuments"],
+            missing_documents=document_status["missingDocuments"],
+        )
+
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": True,
+                "message": "Client details updated successfully.",
+                "clientId": client_id,
+                "updatedFields": updated_fields,
+                "ghlSync": ghl_sync,
+            }),
+            status_code=200,
+            mimetype="application/json",
+        ))
+
+    except Exception as e:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        logging.exception("Update client failed.")
+        return add_cors(func.HttpResponse(
+            json.dumps({
+                "success": False,
+                "message": str(e),
+            }),
+            status_code=500,
+            mimetype="application/json",
+        ))
+
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def handle_client_messages(
     req: func.HttpRequest,
     route_client_id=None,
