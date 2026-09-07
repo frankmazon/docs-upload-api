@@ -1931,10 +1931,6 @@ def sync_client_to_ghl(
         lead_label = format_lead_type(lead_type)
         source_label = format_lead_type(source)
 
-        full_name = " ".join(
-            filter(None, [first_name, middle_name, last_name])
-        ).strip()
-
         tags = [
             "Azure Client Portal",
             "Website Intake",
@@ -1952,11 +1948,10 @@ def sync_client_to_ghl(
 
         payload = {
             "locationId": location_id,
-            "firstName": first_name or "",
-            "lastName": last_name or "",
-            "name": full_name,
-            "email": email,
-            "phone": phone or "",
+            "firstName": clean_value(first_name),
+            "lastName": clean_value(last_name),
+            "email": clean_value(email),
+            "phone": clean_value(phone),
             "source": source_label or "Website Intake",
             "tags": tags,
         }
@@ -2253,11 +2248,10 @@ def notify_referrer_via_ghl(referrer, client_name):
 
         payload = {
             "locationId": location_id,
-            "firstName": referrer.get("firstName") or "",
-            "lastName": referrer.get("lastName") or "",
-            "name": " ".join(filter(None, [referrer.get("firstName"), referrer.get("middleName"), referrer.get("lastName")])),
-            "email": referrer["email"],
-            "phone": referrer.get("phone") or "",
+            "firstName": clean_value(referrer.get("firstName")),
+            "lastName": clean_value(referrer.get("lastName")),
+            "email": clean_value(referrer.get("email")),
+            "phone": clean_value(referrer.get("phone")),
             "source": "SBR Referral Submission",
             "tags": tags,
         }
@@ -2326,11 +2320,6 @@ def notify_co_borrower_via_ghl(co_borrower, client_name):
             "locationId": location_id,
             "firstName": clean_value(co_borrower.get("firstName")),
             "lastName": clean_value(co_borrower.get("lastName")),
-            "name": " ".join(filter(None, [
-                clean_value(co_borrower.get("firstName")),
-                clean_value(co_borrower.get("middleName")),
-                clean_value(co_borrower.get("lastName")),
-            ])),
             "email": email,
             "phone": clean_value(co_borrower.get("phone")),
             "source": "SBR Co-Borrower Submission",
