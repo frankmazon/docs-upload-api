@@ -866,15 +866,16 @@ def ensure_password_reset_tokens_table(cursor):
     """)
 
 
-def send_ghl_password_reset_email(contact_id, email, client_name, reset_url):
+def send_ghl_password_reset_email(contact_id, email, client_name, reset_code):
     ghl_api_base = os.getenv(
         "GHL_API_BASE", "https://services.leadconnectorhq.com"
     ).rstrip("/")
     safe_name = html.escape(clean_value(client_name) or "there")
-    safe_url = html.escape(reset_url, quote=True)
+    safe_code = html.escape(reset_code)
     message = (
         "A password reset was requested for your SBR Funding Client Portal "
-        "account. This link expires in 20 minutes and can only be used once."
+        "account. Use the temporary code below as your password. "
+        "The code expires in 20 minutes."
     )
     response = requests.post(
         f"{ghl_api_base}/conversations/messages",
@@ -884,13 +885,16 @@ def send_ghl_password_reset_email(contact_id, email, client_name, reset_url):
             "contactId": contact_id,
             "emailTo": email,
             "subject": "Reset your SBR Funding Client Portal password",
-            "message": f"{message}\n\nReset password: {reset_url}",
+            "message": f"{message}\n\nTemporary password: {reset_code}",
             "html": (
                 f"<p>Hi {safe_name},</p><p>{html.escape(message)}</p>"
-                f"<p><a href=\"{safe_url}\" style=\"display:inline-block;"
-                "padding:12px 20px;background:#259b8f;color:#fff;"
-                "text-decoration:none;border-radius:8px;font-weight:700\">"
-                "Reset password</a></p>"
+                "<p style=\"margin:24px 0 8px\">Temporary password:</p>"
+                f"<p style=\"display:inline-block;padding:14px 22px;"
+                "background:#f1f5f9;border:1px solid #cbd5e1;border-radius:8px;"
+                "font-family:monospace;font-size:22px;font-weight:700;"
+                f"letter-spacing:3px\">{safe_code}</p>"
+                "<p>Open the Client Portal, paste this code into the Password field, "
+                "and sign in. You will then be required to create a new password.</p>"
                 "<p>If you did not request this, you can safely ignore this email.</p>"
             ),
             "status": "pending",
@@ -5751,7 +5755,7 @@ def client_forgot_password(req: func.HttpRequest) -> func.HttpResponse:
         email = clean_value(data.get("email")).lower()
 
         generic_message = (
-            "If those details match an account, a password reset link will be sent."
+            "If those details match an account, a temporary login code will be sent."
         )
 
         if not unique_id.startswith("CL-") or not email:
@@ -5787,8 +5791,8 @@ def client_forgot_password(req: func.HttpRequest) -> func.HttpResponse:
                 "success": True, "message": generic_message,
             }), status_code=200, mimetype="application/json"))
 
-        raw_token = secrets.token_urlsafe(32)
-        token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        reset_code = secrets.token_hex(4).upper()
+        token_hash = hashlib.sha256(reset_code.encode("utf-8")).hexdigest()
         expires_at = datetime.utcnow() + timedelta(minutes=20)
         requested_ip = clean_value(
             req.headers.get("X-Forwarded-For") or req.headers.get("X-Client-IP")
@@ -5804,20 +5808,20 @@ def client_forgot_password(req: func.HttpRequest) -> func.HttpResponse:
                 ClientId, TokenHash, ExpiresAt, RequestedIp
             ) VALUES (?, ?, ?, ?)
         """, client.Id, token_hash, expires_at, requested_ip or None)
+        cursor.execute("""
+            UPDATE Clients
+            SET PasswordHash = ?, MustChangePassword = 1,
+                PasswordChangedDate = NULL
+            WHERE Id = ?
+        """, hash_client_password(reset_code), client.Id)
         conn.commit()
-
-        frontend_url = os.getenv(
-            "PASSWORD_RESET_URL",
-            "https://dashboard.sbrfunding.com.au/reset-password",
-        ).strip()
-        reset_url = f"{frontend_url}?token={quote(raw_token)}"
 
         try:
             send_ghl_password_reset_email(
                 clean_value(client.GHLContactId),
                 clean_value(client.Email),
                 f"{clean_value(client.FirstName)} {clean_value(client.LastName)}".strip(),
-                reset_url,
+                reset_code,
             )
         except Exception:
             logging.exception("Failed to send password reset email through GHL.")
@@ -6055,6 +6059,12 @@ def client_change_password(req: func.HttpRequest) -> func.HttpResponse:
             changed_at,
             client.Id,
         ))
+        ensure_password_reset_tokens_table(cursor)
+        cursor.execute("""
+            UPDATE dbo.ClientPasswordResetTokens
+            SET UsedAt = SYSUTCDATETIME()
+            WHERE ClientId = ? AND UsedAt IS NULL
+        """, client.Id)
 
         conn.commit()
 
@@ -6606,6 +6616,18 @@ def client_login(req: func.HttpRequest) -> func.HttpResponse:
                 clean_value(client.LastName).casefold(),
             )
             must_change_password = True
+
+        if password_valid and must_change_password:
+            ensure_password_reset_tokens_table(cursor)
+            cursor.execute("""
+                SELECT TOP 1 ExpiresAt
+                FROM dbo.ClientPasswordResetTokens
+                WHERE ClientId = ? AND UsedAt IS NULL
+                ORDER BY CreatedAt DESC
+            """, client.Id)
+            pending_reset = cursor.fetchone()
+            if pending_reset and pending_reset.ExpiresAt <= datetime.utcnow():
+                password_valid = False
 
         if not password_valid:
             return add_cors(func.HttpResponse(
