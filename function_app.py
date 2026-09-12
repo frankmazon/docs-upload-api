@@ -5678,6 +5678,82 @@ def client_messages_legacy(req: func.HttpRequest) -> func.HttpResponse:
 
 
 @app.route(
+    route="client-forgot-password",
+    auth_level=func.AuthLevel.ANONYMOUS,
+    methods=["POST", "OPTIONS"],
+)
+def client_forgot_password(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    conn = None
+    cursor = None
+    try:
+        data = req.get_json()
+        unique_id = clean_value(data.get("uniqueId")).upper()
+        email = clean_value(data.get("email")).lower()
+
+        if not unique_id.startswith("CL-") or not email:
+            return add_cors(func.HttpResponse(json.dumps({
+                "success": False,
+                "message": "A valid Client ID and registered email are required.",
+            }), status_code=400, mimetype="application/json"))
+
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT TOP 1 Id, LastName
+            FROM Clients
+            WHERE UPPER(UniqueId) = ? AND LOWER(Email) = ?
+        """, unique_id, email)
+        client = cursor.fetchone()
+
+        if not client:
+            return add_cors(func.HttpResponse(json.dumps({
+                "success": False,
+                "message": "The Client ID and email do not match our records.",
+            }), status_code=404, mimetype="application/json"))
+
+        temporary_password = clean_value(client.LastName)
+        if not temporary_password:
+            return add_cors(func.HttpResponse(json.dumps({
+                "success": False,
+                "message": "This account cannot be reset automatically. Please contact your specialist.",
+            }), status_code=409, mimetype="application/json"))
+
+        cursor.execute("""
+            UPDATE Clients
+            SET PasswordHash = ?, MustChangePassword = 1, PasswordChangedDate = NULL
+            WHERE Id = ?
+        """, hash_client_password(temporary_password), client.Id)
+        conn.commit()
+
+        return add_cors(func.HttpResponse(json.dumps({
+            "success": True,
+            "message": "Password reset. Your temporary password is your last name. You will be asked to create a new password after signing in.",
+        }), status_code=200, mimetype="application/json"))
+    except ValueError:
+        return add_cors(func.HttpResponse(json.dumps({
+            "success": False, "message": "A valid JSON request body is required."
+        }), status_code=400, mimetype="application/json"))
+    except Exception as exc:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        logging.exception("Client forgot-password reset failed.")
+        return add_cors(func.HttpResponse(json.dumps({
+            "success": False, "message": str(exc)
+        }), status_code=500, mimetype="application/json"))
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+@app.route(
     route="client-change-password",
     auth_level=func.AuthLevel.ANONYMOUS,
     methods=["POST", "OPTIONS"],
