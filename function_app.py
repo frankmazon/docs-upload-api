@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import secrets
 import time
+import html
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, unquote, quote
 from azure.storage.blob import (
@@ -842,6 +843,62 @@ def validate_new_password(password: str) -> list[str]:
         errors.append("Password must contain at least one special character.")
 
     return errors
+
+
+def ensure_password_reset_tokens_table(cursor):
+    cursor.execute("""
+        IF OBJECT_ID('dbo.ClientPasswordResetTokens', 'U') IS NULL
+        BEGIN
+            CREATE TABLE dbo.ClientPasswordResetTokens (
+                Id BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+                ClientId INT NOT NULL,
+                TokenHash CHAR(64) NOT NULL UNIQUE,
+                ExpiresAt DATETIME2 NOT NULL,
+                UsedAt DATETIME2 NULL,
+                RequestedIp NVARCHAR(100) NULL,
+                CreatedAt DATETIME2 NOT NULL
+                    CONSTRAINT DF_ClientPasswordResetTokens_CreatedAt
+                    DEFAULT (SYSUTCDATETIME())
+            );
+            CREATE INDEX IX_ClientPasswordResetTokens_ClientCreated
+                ON dbo.ClientPasswordResetTokens (ClientId, CreatedAt DESC);
+        END
+    """)
+
+
+def send_ghl_password_reset_email(contact_id, email, client_name, reset_url):
+    ghl_api_base = os.getenv(
+        "GHL_API_BASE", "https://services.leadconnectorhq.com"
+    ).rstrip("/")
+    safe_name = html.escape(clean_value(client_name) or "there")
+    safe_url = html.escape(reset_url, quote=True)
+    message = (
+        "A password reset was requested for your SBR Funding Client Portal "
+        "account. This link expires in 20 minutes and can only be used once."
+    )
+    response = requests.post(
+        f"{ghl_api_base}/conversations/messages",
+        headers=get_ghl_headers(),
+        json={
+            "type": "Email",
+            "contactId": contact_id,
+            "emailTo": email,
+            "subject": "Reset your SBR Funding Client Portal password",
+            "message": f"{message}\n\nReset password: {reset_url}",
+            "html": (
+                f"<p>Hi {safe_name},</p><p>{html.escape(message)}</p>"
+                f"<p><a href=\"{safe_url}\" style=\"display:inline-block;"
+                "padding:12px 20px;background:#259b8f;color:#fff;"
+                "text-decoration:none;border-radius:8px;font-weight:700\">"
+                "Reset password</a></p>"
+                "<p>If you did not request this, you can safely ignore this email.</p>"
+            ),
+            "status": "pending",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json() if response.content else {"success": True}
 
 
 def none_if_empty(value):
@@ -5693,16 +5750,19 @@ def client_forgot_password(req: func.HttpRequest) -> func.HttpResponse:
         unique_id = clean_value(data.get("uniqueId")).upper()
         email = clean_value(data.get("email")).lower()
 
+        generic_message = (
+            "If those details match an account, a password reset link will be sent."
+        )
+
         if not unique_id.startswith("CL-") or not email:
             return add_cors(func.HttpResponse(json.dumps({
-                "success": False,
-                "message": "A valid Client ID and registered email are required.",
-            }), status_code=400, mimetype="application/json"))
+                "success": True, "message": generic_message,
+            }), status_code=200, mimetype="application/json"))
 
         conn = get_sql_connection()
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT TOP 1 Id, LastName
+            SELECT TOP 1 Id, FirstName, LastName, Email, GHLContactId
             FROM Clients
             WHERE UPPER(UniqueId) = ? AND LOWER(Email) = ?
         """, unique_id, email)
@@ -5710,27 +5770,61 @@ def client_forgot_password(req: func.HttpRequest) -> func.HttpResponse:
 
         if not client:
             return add_cors(func.HttpResponse(json.dumps({
-                "success": False,
-                "message": "The Client ID and email do not match our records.",
-            }), status_code=404, mimetype="application/json"))
+                "success": True, "message": generic_message,
+            }), status_code=200, mimetype="application/json"))
 
-        temporary_password = clean_value(client.LastName)
-        if not temporary_password:
+        ensure_password_reset_tokens_table(cursor)
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM dbo.ClientPasswordResetTokens
+            WHERE ClientId = ? AND CreatedAt >= DATEADD(hour, -1, SYSUTCDATETIME())
+        """, client.Id)
+        recent_requests = int(cursor.fetchone()[0])
+
+        if recent_requests >= 3:
+            conn.commit()
             return add_cors(func.HttpResponse(json.dumps({
-                "success": False,
-                "message": "This account cannot be reset automatically. Please contact your specialist.",
-            }), status_code=409, mimetype="application/json"))
+                "success": True, "message": generic_message,
+            }), status_code=200, mimetype="application/json"))
+
+        raw_token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        expires_at = datetime.utcnow() + timedelta(minutes=20)
+        requested_ip = clean_value(
+            req.headers.get("X-Forwarded-For") or req.headers.get("X-Client-IP")
+        ).split(",")[0][:100]
 
         cursor.execute("""
-            UPDATE Clients
-            SET PasswordHash = ?, MustChangePassword = 1, PasswordChangedDate = NULL
-            WHERE Id = ?
-        """, hash_client_password(temporary_password), client.Id)
+            UPDATE dbo.ClientPasswordResetTokens
+            SET UsedAt = SYSUTCDATETIME()
+            WHERE ClientId = ? AND UsedAt IS NULL
+        """, client.Id)
+        cursor.execute("""
+            INSERT INTO dbo.ClientPasswordResetTokens (
+                ClientId, TokenHash, ExpiresAt, RequestedIp
+            ) VALUES (?, ?, ?, ?)
+        """, client.Id, token_hash, expires_at, requested_ip or None)
         conn.commit()
+
+        frontend_url = os.getenv(
+            "PASSWORD_RESET_URL",
+            "https://dashboard.sbrfunding.com.au/reset-password",
+        ).strip()
+        reset_url = f"{frontend_url}?token={quote(raw_token)}"
+
+        try:
+            send_ghl_password_reset_email(
+                clean_value(client.GHLContactId),
+                clean_value(client.Email),
+                f"{clean_value(client.FirstName)} {clean_value(client.LastName)}".strip(),
+                reset_url,
+            )
+        except Exception:
+            logging.exception("Failed to send password reset email through GHL.")
 
         return add_cors(func.HttpResponse(json.dumps({
             "success": True,
-            "message": "Password reset. Your temporary password is your last name. You will be asked to create a new password after signing in.",
+            "message": generic_message,
         }), status_code=200, mimetype="application/json"))
     except ValueError:
         return add_cors(func.HttpResponse(json.dumps({
@@ -5743,6 +5837,84 @@ def client_forgot_password(req: func.HttpRequest) -> func.HttpResponse:
             except Exception:
                 pass
         logging.exception("Client forgot-password reset failed.")
+        return add_cors(func.HttpResponse(json.dumps({
+            "success": False, "message": str(exc)
+        }), status_code=500, mimetype="application/json"))
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+@app.route(
+    route="client-reset-password",
+    auth_level=func.AuthLevel.ANONYMOUS,
+    methods=["POST", "OPTIONS"],
+)
+def client_reset_password(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+
+    conn = None
+    cursor = None
+    try:
+        data = req.get_json()
+        token = clean_value(data.get("token"))
+        new_password = data.get("newPassword") or ""
+        errors = validate_new_password(new_password)
+        if not token or errors:
+            return add_cors(func.HttpResponse(json.dumps({
+                "success": False,
+                "message": errors[0] if errors else "The reset link is invalid.",
+                "errors": errors,
+            }), status_code=400, mimetype="application/json"))
+
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        ensure_password_reset_tokens_table(cursor)
+        cursor.execute("""
+            SELECT TOP 1 Id, ClientId
+            FROM dbo.ClientPasswordResetTokens WITH (UPDLOCK, ROWLOCK)
+            WHERE TokenHash = ? AND UsedAt IS NULL
+              AND ExpiresAt > SYSUTCDATETIME()
+        """, token_hash)
+        reset = cursor.fetchone()
+        if not reset:
+            return add_cors(func.HttpResponse(json.dumps({
+                "success": False,
+                "message": "This reset link is invalid, expired, or has already been used.",
+            }), status_code=400, mimetype="application/json"))
+
+        changed_at = datetime.utcnow()
+        cursor.execute("""
+            UPDATE Clients
+            SET PasswordHash = ?, MustChangePassword = 0,
+                PasswordChangedDate = ?
+            WHERE Id = ?
+        """, hash_client_password(new_password), changed_at, reset.ClientId)
+        cursor.execute("""
+            UPDATE dbo.ClientPasswordResetTokens
+            SET UsedAt = SYSUTCDATETIME()
+            WHERE ClientId = ? AND UsedAt IS NULL
+        """, reset.ClientId)
+        conn.commit()
+        return add_cors(func.HttpResponse(json.dumps({
+            "success": True,
+            "message": "Your password has been reset. You can now sign in.",
+        }), status_code=200, mimetype="application/json"))
+    except ValueError:
+        return add_cors(func.HttpResponse(json.dumps({
+            "success": False, "message": "A valid JSON request body is required."
+        }), status_code=400, mimetype="application/json"))
+    except Exception as exc:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        logging.exception("Client password reset failed.")
         return add_cors(func.HttpResponse(json.dumps({
             "success": False, "message": str(exc)
         }), status_code=500, mimetype="application/json"))
