@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import secrets
 import time
+import threading
 import html
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, unquote, quote
@@ -261,7 +262,7 @@ def add_cors(response: func.HttpResponse) -> func.HttpResponse:
     return response
 
 
-def get_sql_connection():
+def get_sql_connection(query_timeout=None):
     conn_str = (
         "DRIVER={ODBC Driver 18 for SQL Server};"
         f"SERVER={os.getenv('SQL_SERVER')};"
@@ -272,7 +273,42 @@ def get_sql_connection():
         "TrustServerCertificate=no;"
         "Connection Timeout=30;"
     )
-    return pyodbc.connect(conn_str)
+    conn = pyodbc.connect(conn_str)
+    if query_timeout is not None:
+        try:
+            conn.timeout = query_timeout
+        except Exception:
+            conn.close()
+            raise
+    return conn
+
+
+def close_sql_resources(cursor, conn):
+    """Attempt both closes even when a failed driver operation breaks cleanup."""
+    for resource in (cursor, conn):
+        if resource is not None:
+            try:
+                resource.close()
+            except Exception:
+                logging.exception("SQL resource cleanup failed.")
+
+
+_notification_reconcile_lock = threading.Lock()
+_notification_reconciled_at = None
+
+
+def refresh_notification_records(conn, cursor):
+    """Reconcile at most once per minute per worker; retry after failures."""
+    global _notification_reconciled_at
+    with _notification_reconcile_lock:
+        if (_notification_reconciled_at is not None
+                and time.monotonic() - _notification_reconciled_at < 60):
+            return
+        ensure_admin_notifications_table(cursor)
+        reconcile_client_submission_notifications(cursor, ensure_schema=False)
+        reconcile_client_document_notifications(cursor, ensure_schema=False)
+        conn.commit()
+        _notification_reconciled_at = time.monotonic()
 
 
 def ensure_admin_notifications_table(cursor):
@@ -327,9 +363,10 @@ def create_admin_notification(
     ))
 
 
-def reconcile_client_submission_notifications(cursor):
+def reconcile_client_submission_notifications(cursor, ensure_schema=True):
     """Capture clients written by another/older API instance sharing this DB."""
-    ensure_admin_notifications_table(cursor)
+    if ensure_schema:
+        ensure_admin_notifications_table(cursor)
     cursor.execute("""
         INSERT INTO AdminNotifications (
             ClientId, UniqueId, ClientName, Title, Message,
@@ -370,9 +407,10 @@ def reconcile_client_submission_notifications(cursor):
     """)
 
 
-def reconcile_client_document_notifications(cursor):
+def reconcile_client_document_notifications(cursor, ensure_schema=True):
     """Capture client files saved by another/older API instance."""
-    ensure_admin_notifications_table(cursor)
+    if ensure_schema:
+        ensure_admin_notifications_table(cursor)
     cursor.execute("""
         INSERT INTO AdminNotifications (
             ClientId, UniqueId, ClientName, Title, Message,
@@ -2274,6 +2312,8 @@ def login(req: func.HttpRequest) -> func.HttpResponse:
     if req.method == "OPTIONS":
         return add_cors(func.HttpResponse("", status_code=204))
 
+    conn = None
+    cursor = None
     try:
         data = req.get_json()
         username = data.get("username", "").strip()
@@ -2289,7 +2329,7 @@ def login(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             ))
 
-        conn = get_sql_connection()
+        conn = get_sql_connection(query_timeout=30)
         cursor = conn.cursor()
 
         cursor.execute("""
@@ -2301,8 +2341,6 @@ def login(req: func.HttpRequest) -> func.HttpResponse:
 
         user = cursor.fetchone()
 
-        cursor.close()
-        conn.close()
 
         if not user:
             return add_cors(func.HttpResponse(
@@ -2338,6 +2376,9 @@ def login(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         ))
+    finally:
+        close_sql_resources(cursor, conn)
+
 
 
 def upsert_referrer_account(
@@ -3541,12 +3582,9 @@ def get_admin_notifications(req: func.HttpRequest) -> func.HttpResponse:
     conn = None
     cursor = None
     try:
-        conn = get_sql_connection()
+        conn = get_sql_connection(query_timeout=30)
         cursor = conn.cursor()
-        ensure_admin_notifications_table(cursor)
-        reconcile_client_submission_notifications(cursor)
-        reconcile_client_document_notifications(cursor)
-        conn.commit()
+        refresh_notification_records(conn, cursor)
         cursor.execute("""
             SELECT TOP 100
                 Id, ClientId, UniqueId, ClientName, Title, Message,
@@ -3584,10 +3622,7 @@ def get_admin_notifications(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
         ))
     finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
+        close_sql_resources(cursor, conn)
 
 
 @app.route(route="notifications/{notification_id}", auth_level=func.AuthLevel.ANONYMOUS, methods=["PATCH", "OPTIONS"])
@@ -4995,12 +5030,14 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
     if req.method == "OPTIONS":
         return add_cors(func.HttpResponse("", status_code=204))
 
+    conn = None
+    cursor = None
     try:
         document_type = req.params.get("documentType")
         search = req.params.get("search")
         unique_id = req.params.get("uniqueId")
 
-        conn = get_sql_connection()
+        conn = get_sql_connection(query_timeout=30)
         cursor = conn.cursor()
 
         query = """
@@ -5245,8 +5282,6 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
                 ),
             })
 
-        cursor.close()
-        conn.close()
 
         return add_cors(func.HttpResponse(
             json.dumps({
@@ -5267,6 +5302,9 @@ def get_clients(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         ))
+    finally:
+        close_sql_resources(cursor, conn)
+
 
 
 @app.route(
