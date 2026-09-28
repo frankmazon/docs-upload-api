@@ -2356,6 +2356,7 @@ def login(req: func.HttpRequest) -> func.HttpResponse:
             json.dumps({
                 "success": True,
                 "message": "Login successful.",
+                "chatToken": issue_chat_token("Admin", int(user.Id), user.Username) if str(user.Role).strip().lower() in ("admin", "administrator") else None,
                 "user": {
                     "id": user.Id,
                     "username": user.Username,
@@ -5548,211 +5549,13 @@ def update_client(req: func.HttpRequest) -> func.HttpResponse:
                 pass
 
 
-def handle_client_messages(
-    req: func.HttpRequest,
-    route_client_id=None,
-) -> func.HttpResponse:
+def handle_client_messages(req: func.HttpRequest, route_client_id=None) -> func.HttpResponse:
+    # The old notes endpoints did not authenticate the caller. Retire them so
+    # chat history is available only through the signed-session /chat endpoint.
     if req.method == "OPTIONS":
         return add_cors(func.HttpResponse("", status_code=204))
-
-    conn = None
-    cursor = None
-
-    try:
-        data = {}
-
-        if req.method == "POST":
-            try:
-                data = req.get_json()
-            except ValueError:
-                data = {}
-
-        client_reference = clean_value(
-            route_client_id
-            or req.params.get("clientId")
-            or req.params.get("uniqueId")
-            or data.get("clientId")
-            or data.get("uniqueId")
-        )
-
-        if not client_reference:
-            return add_cors(func.HttpResponse(
-                json.dumps({
-                    "success": False,
-                    "message": "Client ID is required.",
-                }),
-                status_code=400,
-                mimetype="application/json",
-            ))
-
-        conn = get_sql_connection()
-        cursor = conn.cursor()
-
-        if client_reference.isdigit():
-            cursor.execute("""
-                SELECT
-                    Id,
-                    FirstName,
-                    MiddleName,
-                    LastName
-                FROM dbo.Clients
-                WHERE Id = ?
-            """, int(client_reference))
-        else:
-            cursor.execute("""
-            SELECT
-                Id,
-                FirstName,
-                MiddleName,
-                LastName
-            FROM dbo.Clients
-            WHERE UniqueId = ?
-        """, client_reference)
-
-        client = cursor.fetchone()
-
-        if not client:
-            return add_cors(func.HttpResponse(
-                json.dumps({
-                    "success": False,
-                    "message": "Client not found.",
-                }),
-                status_code=404,
-                mimetype="application/json",
-            ))
-
-        client_id = int(client.Id)
-
-        cursor.execute(
-            "SELECT OBJECT_ID(N'dbo.ClientMessages', N'U')"
-        )
-        table_id_row = cursor.fetchone()
-
-        if not table_id_row or table_id_row[0] is None:
-            return add_cors(func.HttpResponse(
-                json.dumps({
-                    "success": False,
-                    "message": (
-                        "Client message storage is not installed. "
-                        "Run add_client_messages.sql in Azure SQL first."
-                    ),
-                }),
-                status_code=503,
-                mimetype="application/json",
-            ))
-
-        sender_name = " ".join(filter(None, [
-            clean_value(client.FirstName),
-            clean_value(client.MiddleName),
-            clean_value(client.LastName),
-        ])) or "Client"
-
-        if req.method == "POST":
-            message = clean_value(data.get("message") or data.get("note"))
-
-            if not message:
-                return add_cors(func.HttpResponse(
-                    json.dumps({
-                        "success": False,
-                        "message": "Please enter a message.",
-                    }),
-                    status_code=400,
-                    mimetype="application/json",
-                ))
-
-            if len(message) > 2000:
-                return add_cors(func.HttpResponse(
-                    json.dumps({
-                        "success": False,
-                        "message": "The message cannot exceed 2,000 characters.",
-                    }),
-                    status_code=400,
-                    mimetype="application/json",
-                ))
-
-            cursor.execute("""
-                INSERT INTO dbo.ClientMessages (
-                    ClientId,
-                    SenderType,
-                    SenderName,
-                    MessageText
-                )
-                OUTPUT
-                    INSERTED.Id,
-                    INSERTED.ClientId,
-                    INSERTED.SenderType,
-                    INSERTED.SenderName,
-                    INSERTED.MessageText,
-                    INSERTED.CreatedAt
-                VALUES (?, 'Client', ?, ?)
-            """, client_id, sender_name, message)
-
-            created_message = cursor.fetchone()
-            conn.commit()
-
-            return add_cors(func.HttpResponse(
-                json.dumps({
-                    "success": True,
-                    "message": "Your note was sent successfully.",
-                    "clientMessage": client_message_to_dict(created_message),
-                }),
-                status_code=201,
-                mimetype="application/json",
-            ))
-
-        cursor.execute("""
-            SELECT
-                Id,
-                ClientId,
-                SenderType,
-                SenderName,
-                MessageText,
-                CreatedAt
-            FROM dbo.ClientMessages
-            WHERE ClientId = ?
-            ORDER BY CreatedAt ASC, Id ASC
-        """, client_id)
-
-        messages = [
-            client_message_to_dict(row)
-            for row in cursor.fetchall()
-        ]
-
-        return add_cors(func.HttpResponse(
-            json.dumps({
-                "success": True,
-                "clientId": client_id,
-                "messages": messages,
-                "count": len(messages),
-            }),
-            status_code=200,
-            mimetype="application/json",
-        ))
-
-    except Exception as exc:
-        logging.exception("Client messages request failed.")
-
-        return add_cors(func.HttpResponse(
-            json.dumps({
-                "success": False,
-                "message": str(exc),
-            }),
-            status_code=500,
-            mimetype="application/json",
-        ))
-
-    finally:
-        if cursor:
-            try:
-                cursor.close()
-            except Exception:
-                pass
-
-        if conn:
-            try:
-                conn.close()
-            except Exception:
-                pass
+    return chat_response({"success": False,
+        "message": "Please refresh the portal and use the Messages dashboard."}, 410)
 
 
 @app.route(
@@ -6785,6 +6588,7 @@ def client_login(req: func.HttpRequest) -> func.HttpResponse:
             json.dumps({
                 "success": True,
                 "message": "Client login successful.",
+                "chatToken": issue_chat_token("Client", int(client.Id), client_payload["name"]),
                 "mustChangePassword": must_change_password,
                 "client": client_payload,
             }),
@@ -6826,3 +6630,315 @@ def client_login(req: func.HttpRequest) -> func.HttpResponse:
                 conn.close()
             except Exception:
                 pass
+
+
+# Chat sessions are issued only after successful login. Never trust a sender role
+# or a client ID supplied by the browser without checking the signed session.
+def chat_signing_key():
+    key = os.getenv("CHAT_SESSION_SECRET") or os.getenv("SQL_PASSWORD")
+    if not key:
+        raise RuntimeError("Chat session signing is not configured.")
+    return hashlib.sha256(("sbr-chat-session-v1:" + key).encode()).digest()
+
+
+def issue_chat_token(role, user_id, name):
+    payload = json.dumps({"role": role, "id": user_id, "name": name,
+                          "exp": int(time.time()) + 28800}, separators=(",", ":"))
+    encoded = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+    signature = hmac.new(chat_signing_key(), encoded.encode(), hashlib.sha256).hexdigest()
+    return encoded + "." + signature
+
+
+def read_chat_session(req):
+    try:
+        scheme, token = req.headers.get("Authorization", "").split(" ", 1)
+        encoded, signature = token.split(".", 1)
+        expected = hmac.new(chat_signing_key(), encoded.encode(), hashlib.sha256).hexdigest()
+        if scheme != "Bearer" or not hmac.compare_digest(signature, expected):
+            return None
+        session = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+        if session["exp"] <= time.time() or session["role"] not in ("Admin", "Client"):
+            return None
+        if not isinstance(session["id"], int) or session["id"] <= 0:
+            return None
+        return session
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def chat_response(body, status=200):
+    return add_cors(func.HttpResponse(json.dumps(body), status_code=status,
+                                      mimetype="application/json"))
+
+
+@app.route(route="chat", auth_level=func.AuthLevel.ANONYMOUS, methods=["GET", "POST", "OPTIONS"])
+def chat(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+    conn = cursor = None
+    try:
+        session = read_chat_session(req)
+        if not session:
+            return chat_response({"success": False, "message": "Your messaging session expired. Please log in again."}, 401)
+        data = req.get_json() if req.method == "POST" else {}
+        if not isinstance(data, dict) or ("message" in data and not isinstance(data["message"], str)):
+            return chat_response({"success": False, "message": "Invalid chat request."}, 400)
+        requested_id = data.get("clientId") or req.params.get("clientId")
+        client_id = int(requested_id) if requested_id else None
+        if session["role"] == "Client":
+            if client_id is not None and client_id != session["id"]:
+                return chat_response({"success": False, "message": "Access denied."}, 403)
+            client_id = session["id"]
+        message = str(data.get("message") or "").strip()
+        if req.method == "POST" and (not client_id or not message or len(message) > 2000):
+            return chat_response({"success": False, "message": "Choose a conversation and enter 1–2,000 characters."}, 400)
+        conn = get_sql_connection(query_timeout=30)
+        cursor = conn.cursor()
+        if client_id is None:
+            cursor.execute("""
+                SELECT c.Id, c.UniqueId,
+                    LTRIM(RTRIM(CONCAT(c.FirstName, ' ', c.MiddleName, ' ', c.LastName))) AS Name,
+                    latest.MessageText, latest.CreatedAt, latest.Id AS LastMessageId,
+                    latest.SenderType
+                FROM dbo.Clients c
+                OUTER APPLY (SELECT TOP 1 Id, MessageText, CreatedAt, SenderType
+                    FROM dbo.ClientMessages WHERE ClientId = c.Id
+                    ORDER BY CreatedAt DESC, Id DESC) latest
+                ORDER BY latest.CreatedAt DESC, c.Id DESC
+            """)
+            conversations = [{"id": r.Id, "uniqueId": r.UniqueId, "name": r.Name,
+                "preview": r.MessageText or "Start a conversation",
+                "lastMessageId": r.LastMessageId or 0, "senderType": r.SenderType or "",
+                "updatedAt": r.CreatedAt.replace(tzinfo=timezone.utc).isoformat() if r.CreatedAt else None}
+                for r in cursor.fetchall()]
+            return chat_response({"success": True, "conversations": conversations})
+        cursor.execute("SELECT Id FROM dbo.Clients WHERE Id = ?", client_id)
+        if not cursor.fetchone():
+            return chat_response({"success": False, "message": "Client not found."}, 404)
+        if req.method == "POST":
+            cursor.execute("""
+                INSERT INTO dbo.ClientMessages (ClientId, SenderType, SenderName, MessageText)
+                OUTPUT INSERTED.Id, INSERTED.ClientId, INSERTED.SenderType,
+                    INSERTED.SenderName, INSERTED.MessageText, INSERTED.CreatedAt
+                VALUES (?, ?, ?, ?)
+            """, client_id, session["role"], session["name"], message)
+            created = client_message_to_dict(cursor.fetchone())
+            conn.commit()
+            return chat_response({"success": True, "clientMessage": created}, 201)
+        cursor.execute("""
+            SELECT Id, ClientId, SenderType, SenderName, MessageText, CreatedAt
+            FROM dbo.ClientMessages WHERE ClientId = ? ORDER BY CreatedAt ASC, Id ASC
+        """, client_id)
+        return chat_response({"success": True, "messages": [client_message_to_dict(r) for r in cursor.fetchall()]})
+    except (ValueError, TypeError):
+        return chat_response({"success": False, "message": "Invalid chat request."}, 400)
+    except Exception:
+        logging.exception("Chat request failed.")
+        return chat_response({"success": False, "message": "Messages are temporarily unavailable. Please try again."}, 500)
+    finally:
+        close_sql_resources(cursor, conn)
+
+
+def ensure_chat_reads(cursor):
+    cursor.execute("""
+        IF OBJECT_ID(N'dbo.ChatReadState', N'U') IS NULL
+        BEGIN
+            DECLARE @lockResult int;
+            EXEC @lockResult = sp_getapplock @Resource='ChatReadStateSetup',
+                @LockMode='Exclusive', @LockOwner='Transaction', @LockTimeout=10000;
+            IF @lockResult < 0 THROW 50001, 'Unable to initialize chat read state.', 1;
+            IF OBJECT_ID(N'dbo.ChatReadState', N'U') IS NULL
+            CREATE TABLE dbo.ChatReadState (
+                ReaderRole nvarchar(16) NOT NULL,
+                ReaderId int NOT NULL,
+                ClientId int NOT NULL,
+                LastReadId bigint NOT NULL DEFAULT 0,
+                CONSTRAINT PK_ChatReadState PRIMARY KEY (ReaderRole, ReaderId, ClientId)
+            );
+        END
+    """)
+
+
+@app.route(route="chat/notifications", auth_level=func.AuthLevel.ANONYMOUS, methods=["GET", "PATCH", "OPTIONS"])
+def chat_notifications(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS":
+        return add_cors(func.HttpResponse("", status_code=204))
+    conn = cursor = None
+    try:
+        session = read_chat_session(req)
+        if not session:
+            return chat_response({"success": False, "message": "Please sign in again to receive message alerts."}, 401)
+        role, reader_id = session["role"], session["id"]
+        incoming = "Client" if role == "Admin" else "Admin"
+        data = req.get_json() if req.method == "PATCH" else {}
+        if not isinstance(data, dict):
+            return chat_response({"success": False, "message": "Invalid request."}, 400)
+        if req.method == "PATCH":
+            client_id, last_id = int(data.get("clientId", 0)), int(data.get("lastMessageId", 0))
+            if client_id <= 0 or last_id <= 0:
+                return chat_response({"success": False, "message": "Invalid message reference."}, 400)
+            if role == "Client" and client_id != reader_id:
+                return chat_response({"success": False, "message": "Access denied."}, 403)
+        conn = get_sql_connection(query_timeout=30)
+        cursor = conn.cursor()
+        ensure_chat_reads(cursor)
+        conn.commit()
+        if req.method == "PATCH":
+            cursor.execute("SELECT Id FROM dbo.ClientMessages WHERE Id = ? AND ClientId = ? AND SenderType = ?", last_id, client_id, incoming)
+            if not cursor.fetchone():
+                return chat_response({"success": False, "message": "Message not found."}, 404)
+            cursor.execute("""
+                MERGE dbo.ChatReadState WITH (HOLDLOCK) AS target
+                USING (SELECT ? AS ReaderRole, ? AS ReaderId, ? AS ClientId, ? AS LastReadId) AS source
+                ON target.ReaderRole=source.ReaderRole AND target.ReaderId=source.ReaderId AND target.ClientId=source.ClientId
+                WHEN MATCHED AND target.LastReadId < source.LastReadId THEN UPDATE SET LastReadId=source.LastReadId
+                WHEN NOT MATCHED THEN INSERT (ReaderRole, ReaderId, ClientId, LastReadId)
+                    VALUES (source.ReaderRole, source.ReaderId, source.ClientId, source.LastReadId);
+            """, role, reader_id, client_id, last_id)
+            conn.commit()
+            return chat_response({"success": True})
+        cursor.execute("""
+            SELECT m.ClientId, COUNT(*) AS UnreadCount, MAX(m.Id) AS LastMessageId,
+                MAX(m.CreatedAt) AS UpdatedAt,
+                LTRIM(RTRIM(CONCAT(c.FirstName, ' ', c.MiddleName, ' ', c.LastName))) AS Name
+            FROM dbo.ClientMessages m
+            JOIN dbo.Clients c ON c.Id=m.ClientId
+            LEFT JOIN dbo.ChatReadState r ON r.ClientId=m.ClientId AND r.ReaderRole=? AND r.ReaderId=?
+            WHERE m.SenderType=? AND m.Id > COALESCE(r.LastReadId,0)
+                AND (?='Admin' OR m.ClientId=?)
+            GROUP BY m.ClientId, c.FirstName, c.MiddleName, c.LastName
+            ORDER BY MAX(m.Id) DESC
+        """, role, reader_id, incoming, role, reader_id)
+        items = [{"clientId": r.ClientId, "name": r.Name if role == "Admin" else "SBR Funding Team",
+                  "unreadCount": r.UnreadCount, "lastMessageId": r.LastMessageId,
+                  "updatedAt": r.UpdatedAt.replace(tzinfo=timezone.utc).isoformat()} for r in cursor.fetchall()]
+        return chat_response({"success": True, "notifications": items,
+                              "unreadCount": sum(item["unreadCount"] for item in items)})
+    except (ValueError, TypeError):
+        return chat_response({"success": False, "message": "Invalid request."}, 400)
+    except Exception:
+        logging.exception("Chat notifications failed")
+        return chat_response({"success": False, "message": "Message alerts are temporarily unavailable."}, 500)
+    finally:
+        close_sql_resources(cursor, conn)
+
+
+# Completed privacy documents are immutable snapshots of the submission and signatures.
+def ensure_privacy_documents_table(cursor):
+    cursor.execute("""
+        IF OBJECT_ID('dbo.ClientPrivacyDocuments', 'U') IS NULL
+        BEGIN
+            DECLARE @lockResult int;
+            EXEC @lockResult = sp_getapplock @Resource='sbr-privacy-schema-v1',
+                @LockMode='Exclusive', @LockOwner='Transaction', @LockTimeout=10000;
+            IF @lockResult < 0 THROW 50001, 'Privacy schema lock unavailable', 1;
+            IF OBJECT_ID('dbo.ClientPrivacyDocuments', 'U') IS NULL
+                CREATE TABLE dbo.ClientPrivacyDocuments (
+                    ClientId int NOT NULL PRIMARY KEY REFERENCES dbo.Clients(Id),
+                    DocumentId uniqueidentifier NOT NULL UNIQUE,
+                    TemplateVersion int NOT NULL,
+                    DocumentJson nvarchar(max) NOT NULL,
+                    SignedAt datetime2 NOT NULL DEFAULT SYSUTCDATETIME()
+                );
+        END
+    """)
+
+
+def privacy_submission(cursor, client_id):
+    cursor.execute("""SELECT UniqueId, FirstName, MiddleName, LastName,
+        SubmittedAt, WithBorrowersGuarantors FROM dbo.Clients WHERE Id=?""", client_id)
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    name = ' '.join(str(v).strip() for v in (row.FirstName, row.MiddleName, row.LastName) if v and str(v).strip())
+    borrowers = [{'id': 'borrower', 'name': name}]
+    if str(row.WithBorrowersGuarantors or '').strip().lower() == 'yes':
+        cursor.execute("""SELECT Id, FirstName, MiddleName, LastName
+            FROM dbo.ClientCoBorrowers WHERE ClientId=? ORDER BY SortOrder, Id""", client_id)
+        for co in cursor.fetchall():
+            co_name = ' '.join(str(v).strip() for v in (co.FirstName, co.MiddleName, co.LastName) if v and str(v).strip())
+            if not co_name:
+                raise ValueError('A co-borrower name is missing. Please contact the team to update your submission.')
+            borrowers.append({'id': 'co-' + str(co.Id), 'name': co_name})
+        if len(borrowers) == 1:
+            raise ValueError('Your submission indicates co-borrowers but their details are missing. Please contact the team.')
+    if not name or not row.SubmittedAt:
+        raise ValueError('Your submission name or date is missing. Please contact the team.')
+    # The document displays the recorded submission calendar date, without a timezone shift.
+    submission = {'uniqueId': row.UniqueId, 'submittedAt': row.SubmittedAt.date().isoformat(), 'borrowers': borrowers}
+    revision = hashlib.sha256(json.dumps(submission, sort_keys=True).encode()).hexdigest()
+    return {'submission': submission, 'revision': revision, 'templateVersion': 1}
+
+
+def privacy_signatures(data, borrowers, signed_at):
+    entries = data.get('signatures')
+    if not isinstance(entries, dict) or set(entries) != {b['id'] for b in borrowers}:
+        raise ValueError('Every listed borrower must provide their own signature.')
+    result = {}
+    for borrower in borrowers:
+        entry = entries[borrower['id']]
+        if not isinstance(entry, dict) or entry.get('consent') is not True:
+            raise ValueError('Every borrower must confirm their consent.')
+        image = entry.get('image')
+        if not isinstance(image, str) or not image.startswith('data:image/png;base64,') or len(image) > 300000:
+            raise ValueError('Invalid signature image.')
+        try:
+            raw = base64.b64decode(image.split(',', 1)[1], validate=True)
+        except ValueError:
+            raise ValueError('Invalid signature image.')
+        if (len(raw) < 50 or raw[:8] != b'\x89PNG\r\n\x1a\n' or raw[12:16] != b'IHDR'
+                or int.from_bytes(raw[16:20], 'big') != 900 or int.from_bytes(raw[20:24], 'big') != 300):
+            raise ValueError('Invalid signature image dimensions.')
+        result[borrower['id']] = {'image': image, 'signedAt': signed_at, 'consent': True}
+    return result
+
+
+@app.route(route="privacy-document", auth_level=func.AuthLevel.ANONYMOUS, methods=["GET", "POST", "OPTIONS"])
+def privacy_document(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == 'OPTIONS':
+        return add_cors(func.HttpResponse('', status_code=204))
+    session = read_chat_session(req)
+    if not session or session['role'] != 'Client':
+        return chat_response({'message': 'Please sign in to your client portal.'}, 401)
+    conn = cursor = None
+    try:
+        data = req.get_json() if req.method == 'POST' else {}
+        if not isinstance(data, dict):
+            return chat_response({'message': 'Invalid request.'}, 400)
+        conn = get_sql_connection(query_timeout=30)
+        cursor = conn.cursor()
+        ensure_privacy_documents_table(cursor)
+        conn.commit()
+        # Serialize signing with updates to the parent submission and concurrent submissions.
+        cursor.execute('SELECT Id FROM dbo.Clients WITH (UPDLOCK, HOLDLOCK) WHERE Id=?', session['id'])
+        if not cursor.fetchone():
+            return chat_response({'message': 'Client submission not found.'}, 404)
+        cursor.execute('SELECT DocumentJson FROM dbo.ClientPrivacyDocuments WHERE ClientId=?', session['id'])
+        saved = cursor.fetchone()
+        if saved:
+            return chat_response(json.loads(saved[0]))
+        document = privacy_submission(cursor, session['id'])
+        if req.method == 'GET':
+            return chat_response(document)
+        if data.get('revision') != document['revision'] or data.get('templateVersion') != 1:
+            return chat_response({'message': 'Your submission has changed. Reload the document before signing.'}, 409)
+        signed_at = datetime.now(timezone.utc).isoformat()
+        document.update(id=str(uuid.uuid4()), signedAt=signed_at,
+            signatures=privacy_signatures(data, document['submission']['borrowers'], signed_at))
+        cursor.execute("""INSERT INTO dbo.ClientPrivacyDocuments
+            (ClientId, DocumentId, TemplateVersion, DocumentJson) VALUES (?, ?, ?, ?)""",
+            session['id'], document['id'], 1, json.dumps(document))
+        conn.commit()
+        return chat_response(document)
+    except ValueError as exc:
+        return chat_response({'message': str(exc)}, 400)
+    except Exception:
+        logging.exception('Privacy document request failed.')
+        return chat_response({'message': 'The document could not be loaded or saved. Please try again.'}, 503)
+    finally:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        close_sql_resources(cursor, conn)
