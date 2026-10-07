@@ -6942,3 +6942,7 @@ def privacy_document(req: func.HttpRequest) -> func.HttpResponse:
             except Exception:
                 pass
         close_sql_resources(cursor, conn)
+
+# Server-to-server SMS integration; sending remains disabled by default.
+from sms_integration import register_sms
+register_sms(app, get_sql_connection, get_client_document_status, get_ghl_headers)
