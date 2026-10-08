@@ -22,6 +22,8 @@ TEMPLATES = {
 
 def phone_number(value):
     phone = re.sub(r'[\s().-]', '', str(value or ''))
+    if re.fullmatch(r'\+?610[23478]\d{8}', phone):
+        phone = '+61' + phone.lstrip('+')[3:]
     if re.fullmatch(r'04\d{8}', phone):
         phone = '+61' + phone[1:]
     elif re.fullmatch(r'61\d{9}', phone):

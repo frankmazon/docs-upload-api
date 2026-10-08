@@ -7,7 +7,7 @@ The adapter now follows that default while retaining blocks for explicit global 
 SMS active/permanent DND, opt-out tags, malformed DND values, contact identity and
 phone mismatches. Missing GHL phone now returns `missing_ghl_phone` instead of a generic error.
 Earlier notes below about requiring an explicitly present false DND field are superseded.
-Sending remains disabled; dry-run verification must pass before activation.
+Australian numbers entered with both +61 and the local leading zero are now normalized before comparing portal and GHL values. Sending remains disabled; dry-run verification must pass before activation.
 
 # CompleteSMS document messages
 

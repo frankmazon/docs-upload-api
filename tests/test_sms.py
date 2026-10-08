@@ -102,6 +102,11 @@ class SmsTests(unittest.TestCase):
         self.assertEqual(self.request()[1]['reason'], 'missing_ghl_phone')
         self.post.assert_not_called()
 
+    def test_australian_trunk_prefix_reaches_preview(self):
+        self.client.Phone = '+61 0411222333'
+        self.assertEqual(self.request()[1]['state'], 'preview')
+        self.post.assert_not_called()
+
     def test_phone_mismatch_blocks(self):
         self.get.return_value.json.return_value['contact']['phone'] = '+61499999999'
         self.assertEqual(self.request()[1]['reason'], 'phone_mismatch')
@@ -143,6 +148,9 @@ class SmsTests(unittest.TestCase):
 
     def test_phone_normalization_and_invalid_values(self):
         self.assertEqual(sms.phone_number('0411 222 333'), '+61411222333')
+        self.assertEqual(sms.phone_number('+61 0436435441'), '+61436435441')
+        self.assertEqual(sms.phone_number('610436435441'), '+61436435441')
+        self.assertEqual(sms.phone_number('+61 (03) 8696 6503'), '+61386966503')
         with self.assertRaises(ValueError):
             sms.phone_number('not a phone')
 
