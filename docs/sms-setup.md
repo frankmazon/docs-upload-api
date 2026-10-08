@@ -1,3 +1,14 @@
+## Correction (2026-10-08)
+
+GHL explicitly documents that an absent global `dnd` field means false across its APIs:
+https://marketplace.gohighlevel.com/docs/2021-07-28/webhook/ContactDndUpdate/index.html
+
+The adapter now follows that default while retaining blocks for explicit global DND,
+SMS active/permanent DND, opt-out tags, malformed DND values, contact identity and
+phone mismatches. Missing GHL phone now returns `missing_ghl_phone` instead of a generic error.
+Earlier notes below about requiring an explicitly present false DND field are superseded.
+Sending remains disabled; dry-run verification must pass before activation.
+
 # CompleteSMS document messages
 
 Status (2026-10-07): SMS endpoint deployed to docsuploadpythonapi-flex, server credentials configured, SMS_SENDING_ENABLED=false. All 36 regression tests pass. Direct provider tests previously confirmed Australian mobile delivery; no automated workflow SMS has been sent. GHL action authorization and workflow wiring remain to be completed. Production contact responses checked during deployment omitted DND fields; the endpoint deliberately blocks sending for those records pending explicit opt-out-state verification.

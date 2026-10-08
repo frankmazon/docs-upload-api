@@ -37,8 +37,9 @@ def message_text(stage, name):
 
 
 def blocked_contact(contact):
-    # Fail closed when GHL does not return an explicit DND state.
-    if contact.get('dnd') is not False:
+    # GHL documents absent global DND as false across its APIs.
+    # Explicit null or malformed values remain unverified.
+    if contact.get('dnd', False) is not False:
         return True
     sms = (contact.get('dndSettings') or {}).get('SMS') or {}
     if str(sms.get('status', '')).lower() in ('active', 'permanent'):
@@ -156,6 +157,8 @@ def register_sms(app, connect, document_status, ghl_headers):
             if contact.get('id') != client.GHLContactId or blocked_contact(contact):
                 return reply({'state': 'skipped', 'reason': 'contact_opted_out_or_unverified'})
             # Avoid delivering to a stale number whose consent cannot be checked.
+            if not contact.get('phone'):
+                return reply({'state': 'blocked', 'reason': 'missing_ghl_phone'}, 409)
             if phone_number(contact.get('phone')) != phone:
                 return reply({'state': 'blocked', 'reason': 'phone_mismatch'}, 409)
             enabled = os.getenv('SMS_SENDING_ENABLED', '').lower() == 'true'

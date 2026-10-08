@@ -84,9 +84,23 @@ class SmsTests(unittest.TestCase):
         self.assertEqual(self.request()[1]['state'], 'skipped')
         self.post.assert_not_called()
 
-    def test_missing_dnd_fails_closed(self):
-        self.assertTrue(sms.blocked_contact({}))
+    def test_absent_dnd_uses_documented_false_default(self):
+        self.assertFalse(sms.blocked_contact({}))
+        self.assertTrue(sms.blocked_contact({'dnd': None}))
+        self.assertTrue(sms.blocked_contact({'dnd': 'false'}))
+        self.assertTrue(sms.blocked_contact({'tags': ['sms-opt-out']}))
+        self.assertTrue(sms.blocked_contact({'dndSettings': {'SMS': {'status': 'permanent'}}}))
         self.assertTrue(sms.blocked_contact({'dnd': False, 'dndSettings': {'SMS': {'status': 'active'}}}))
+
+    def test_missing_dnd_reaches_preview_without_sending(self):
+        del self.get.return_value.json.return_value['contact']['dnd']
+        self.assertEqual(self.request()[1]['state'], 'preview')
+        self.post.assert_not_called()
+
+    def test_missing_ghl_phone_is_explicitly_blocked(self):
+        del self.get.return_value.json.return_value['contact']['phone']
+        self.assertEqual(self.request()[1]['reason'], 'missing_ghl_phone')
+        self.post.assert_not_called()
 
     def test_phone_mismatch_blocks(self):
         self.get.return_value.json.return_value['contact']['phone'] = '+61499999999'
