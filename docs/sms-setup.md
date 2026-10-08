@@ -1,3 +1,14 @@
+## Live test and activation (2026-10-08)
+
+User authorized one live test to their Australian mobile ending 5441 and plans a website test next.
+Azure `SMS_SENDING_ENABLED=true` is now set. GHL actions still require `dryRun:false` to send.
+The authorized submission test for CL-1D388076 returned HTTP 200, state queued, eventId 1.
+SQL confirms provider ID 920736391. This proves provider acceptance, not delivery;
+confirm handset receipt or CompleteSMS Reports separately. No automatic retry was made.
+The same client/stage is deduplicated; another request for that existing submission will not resend.
+Earlier disabled-sending status notes below describe the setup history and are superseded here.
+Upload receipt bridge and reminder workflow wiring remain incomplete as documented below.
+
 ## Correction (2026-10-08)
 
 GHL explicitly documents that an absent global `dnd` field means false across its APIs:
