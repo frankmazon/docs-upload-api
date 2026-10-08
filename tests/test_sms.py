@@ -204,5 +204,78 @@ class SubmissionJobTests(unittest.TestCase):
         self.handler.assert_not_called()
 
 
+class DocumentJobTests(unittest.TestCase):
+    def setUp(self):
+        self.env = patch.dict(os.environ, {'SMS_SENDING_ENABLED':'true','SMS_WEBHOOK_SECRET':'test'})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.conn = Mock()
+        self.cursor = self.conn.cursor.return_value
+        self.connect = Mock(return_value=self.conn)
+
+    def test_first_reminder_is_48_hours_from_submission(self):
+        submitted = datetime(2026, 10, 8, 1, 0)
+        self.cursor.fetchone.return_value = (submitted,)
+        sms.schedule_document_sms(self.cursor, 1, 'reminder1')
+        self.assertEqual(self.cursor.execute.call_args.args[-1], submitted + timedelta(hours=48))
+
+    def test_later_reminder_is_48_hours_from_previous_acceptance(self):
+        queued = datetime(2026, 10, 10, 1, 3)
+        self.cursor.fetchone.return_value = (queued,)
+        sms.schedule_document_sms(self.cursor, 1, 'reminder2')
+        self.assertEqual(self.cursor.execute.call_args.args[-1], queued + timedelta(hours=48))
+        self.assertEqual(self.cursor.execute.call_args_list[1].args[-1], 'reminder1')
+
+    def test_receipt_requires_saved_document(self):
+        with self.assertRaises(ValueError):
+            sms.schedule_document_sms(self.cursor, 1, 'received', 0)
+        self.cursor.execute.assert_not_called()
+
+    def test_upload_schedules_only_receipt(self):
+        sms.schedule_document_sms(self.cursor, 1, 'received', 25)
+        args = self.cursor.execute.call_args.args
+        self.assertEqual(args[1:4], (1,'received',25))
+        self.assertNotIn('SubmittedAt', str(self.cursor.execute.call_args_list))
+
+    def process(self, stage, result, code=200):
+        self.cursor.fetchone.side_effect = [(1,), (8,1,stage,25 if stage=='received' else 0,1), ('CL-TEST',), (1,), None]
+        handler = Mock(return_value=sms.func.HttpResponse(json.dumps(result),status_code=code))
+        with patch.object(sms,'schedule_document_sms') as schedule:
+            sms.process_document_jobs(self.connect,handler)
+        return schedule,handler
+
+    def test_success_schedules_next_reminder(self):
+        schedule,handler = self.process('reminder1',{'state':'queued'})
+        schedule.assert_called_once_with(self.cursor,1,'reminder2')
+        self.assertEqual(handler.call_args.args[0].get_json()['stage'],'reminder1')
+
+    def test_recovered_reservation_schedules_next_without_resend(self):
+        schedule,_ = self.process('reminder3',{'state':'duplicate','previousState':'queued'})
+        schedule.assert_called_once_with(self.cursor,1,'reminder4')
+
+    def test_completed_or_opted_out_file_stops_sequence(self):
+        for reason in ('no_outstanding_documents','contact_opted_out_or_unverified','file_inactive'):
+            schedule,_ = self.process('reminder2',{'state':'skipped','reason':reason})
+            schedule.assert_not_called()
+
+    def test_fifth_reminder_ends_sequence(self):
+        schedule,_ = self.process('reminder5',{'state':'queued'})
+        schedule.assert_not_called()
+
+    def test_receipt_does_not_restart_reminders(self):
+        schedule,_ = self.process('received',{'state':'queued'})
+        schedule.assert_not_called()
+
+    def test_unknown_or_rejected_send_does_not_advance(self):
+        for result in ({'state':'unknown'},{'state':'rejected'},{'state':'duplicate','previousState':'unknown'}):
+            schedule,_ = self.process('reminder1',result)
+            schedule.assert_not_called()
+
+    def test_transient_failures_retry_but_do_not_advance(self):
+        response=sms.func.HttpResponse(json.dumps({'error':'unavailable'}),status_code=503)
+        self.assertEqual(sms.document_job_outcome(response,1)[0],'pending')
+        self.assertEqual(sms.document_job_outcome(response,3)[0],'failed')
+
+
 if __name__ == '__main__':
     unittest.main()

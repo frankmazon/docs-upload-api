@@ -1,3 +1,15 @@
+## Document receipts and reminders (2026-10-08)
+
+Every newly saved document queues one `received` SMS in `ClientDocumentSmsJobs`, in the upload transaction. A retry of the SMS job cannot send that document's acknowledgment twice. Separate uploaded files each have their own acknowledgment. Receipt jobs have a one-minute delay to allow initial GHL synchronization.
+
+New initial submissions with successful GHL synchronization also queue `reminder1` for SubmittedAt + 48 hours. Accepted reminders 1–4 atomically schedule the next reminder for 48 hours after the preceding SMS event. Reminder5 ends the sequence and does not change the client's status. The monitored worker runs each minute; outages can delay sending but cannot compress the 48-hour spacing.
+
+Before each reminder the existing guarded handler checks for outstanding documents, inactive files and GHL opt-outs. Pending-review documents count as received; rejected/declined/failed documents remain outstanding unless replaced or waived. No remaining documents or an inactive/opted-out contact stops the sequence. Partial uploads neither reset nor accelerate reminder jobs. Unknown/rejected provider outcomes halt the sequence for review; they are not automatically resent.
+
+These jobs apply to new submissions/uploads after deployment; old records are not backfilled. The existing submission confirmation remains unchanged. The GHL stage endpoint shares the same send reservations, preventing duplicate sends of the same stage if called alongside the worker. No additional GHL reminder actions are required. Inspect `ClientDocumentSmsJobs` for pending/done/stopped/failed and `ClientSmsEvents` for provider acceptance.
+
+Validation: 57 automated tests; transactional SQL checks for distinct upload jobs, idempotent scheduling, 48-hour due dates, and atomic claims. SQL checks roll back and do not send SMS.
+
 ## Website submission SMS jobs (2026-10-08)
 
 New initial website submissions now schedule a durable `ClientSmsJobs` row in the same transaction that saves the GHL contact link. A monitored timer processes jobs once per minute through the existing guarded SMS handler. This removes the dependency on a fresh GHL workflow enrollment for submission SMS; existing contacts can remain in their reminder workflow. Partial document uploads do not schedule a new submission SMS.

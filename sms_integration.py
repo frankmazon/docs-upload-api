@@ -198,6 +198,126 @@ def process_submission_jobs(connect, handler):
                         pass
 
 
+def schedule_document_sms(cursor, client_id, stage, document_id=0):
+    """Enqueue only explicit new uploads/submissions; never reset an existing job."""
+    if stage != 'received' and stage not in {f'reminder{i}' for i in range(1, 6)}:
+        raise ValueError('Invalid document SMS stage')
+    if stage == 'received' and document_id <= 0:
+        raise ValueError('A saved document is required')
+    cursor.execute("""
+        DECLARE @lock int;
+        EXEC @lock = sp_getapplock @Resource='SbrDocumentSmsJobsSchema',
+            @LockMode='Exclusive', @LockOwner='Transaction', @LockTimeout=10000;
+        IF @lock < 0 THROW 51000, 'Document SMS schema lock unavailable', 1;
+        IF OBJECT_ID('dbo.ClientDocumentSmsJobs', 'U') IS NULL
+        CREATE TABLE dbo.ClientDocumentSmsJobs (
+            Id bigint IDENTITY PRIMARY KEY,
+            ClientId int NOT NULL REFERENCES dbo.Clients(Id) ON DELETE CASCADE,
+            Stage varchar(16) NOT NULL,
+            DocumentId int NOT NULL DEFAULT 0,
+            State varchar(16) NOT NULL DEFAULT 'pending',
+            Attempts int NOT NULL DEFAULT 0,
+            AvailableAt datetime2 NOT NULL,
+            Result varchar(80) NULL,
+            CONSTRAINT UQ_ClientDocumentSmsJob UNIQUE(ClientId,Stage,DocumentId)
+        );
+    """)
+    if stage == 'received':
+        due = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=1)
+    elif stage == 'reminder1':
+        cursor.execute('SELECT SubmittedAt FROM dbo.Clients WHERE Id=?', client_id)
+        row = cursor.fetchone()
+        if not row or not row[0]:
+            return
+        due = row[0] + timedelta(hours=48)
+    else:
+        cursor.execute("SELECT CreatedAt FROM dbo.ClientSmsEvents WHERE ClientId=? AND Stage=? AND State='queued'", client_id, f'reminder{int(stage[-1])-1}')
+        row = cursor.fetchone()
+        if not row:
+            return
+        due = row[0] + timedelta(hours=48)
+    cursor.execute("""
+        IF NOT EXISTS (SELECT 1 FROM dbo.ClientDocumentSmsJobs WITH (UPDLOCK,HOLDLOCK)
+                       WHERE ClientId=? AND Stage=? AND DocumentId=?)
+        INSERT INTO dbo.ClientDocumentSmsJobs(ClientId,Stage,DocumentId,AvailableAt) VALUES(?,?,?,?)
+    """, client_id, stage, document_id, client_id, stage, document_id, due)
+
+
+def document_job_outcome(response, attempts):
+    result = json.loads(response.get_body())
+    state = result.get('state', 'error')
+    accepted = state == 'queued' or (state == 'duplicate' and result.get('previousState') == 'queued')
+    retry = attempts < 3 and (response.status_code >= 500 or result.get('reason') in ('missing_ghl_contact', 'not_due'))
+    status = 'pending' if retry else ('done' if accepted else ('stopped' if state == 'skipped' else 'failed'))
+    return status, str(result.get('reason', state))[:80], accepted
+
+
+def process_document_jobs(connect, handler):
+    if os.getenv('SMS_SENDING_ENABLED', '').lower() != 'true' or not os.getenv('SMS_WEBHOOK_SECRET'):
+        return
+    for _ in range(5):
+        conn = cursor = None
+        try:
+            conn = connect(query_timeout=15)
+            cursor = conn.cursor()
+            cursor.execute("SELECT OBJECT_ID('dbo.ClientDocumentSmsJobs','U')")
+            if not cursor.fetchone()[0]:
+                return
+            cursor.execute("""
+                UPDATE dbo.ClientDocumentSmsJobs SET State='failed',Result='lease_exhausted'
+                WHERE State='processing' AND Attempts>=3 AND AvailableAt<=SYSUTCDATETIME();
+            """)
+            cursor.execute("""
+                ;WITH next_job AS (
+                    SELECT TOP (1) * FROM dbo.ClientDocumentSmsJobs WITH (UPDLOCK,READPAST,READCOMMITTEDLOCK)
+                    WHERE State IN ('pending','processing') AND Attempts<3 AND AvailableAt<=SYSUTCDATETIME()
+                    ORDER BY AvailableAt,Id
+                )
+                UPDATE next_job SET State='processing',Attempts=Attempts+1,
+                    AvailableAt=DATEADD(minute,5,SYSUTCDATETIME())
+                OUTPUT INSERTED.Id,INSERTED.ClientId,INSERTED.Stage,INSERTED.DocumentId,INSERTED.Attempts;
+            """)
+            job = cursor.fetchone()
+            if not job:
+                conn.commit()
+                return
+            job_id, client_id, stage, document_id, attempts = job
+            cursor.execute('SELECT UniqueId FROM dbo.Clients WHERE Id=?', client_id)
+            client = cursor.fetchone()
+            conn.commit()
+            if not client:
+                continue
+            req = func.HttpRequest(method='POST',url='/api/sms/document-stage',
+                headers={'Authorization':'Bearer '+os.environ['SMS_WEBHOOK_SECRET']},
+                body=json.dumps({'clientId':client[0],'stage':stage,'documentId':document_id,'dryRun':False}).encode())
+            response = handler(req)
+            status, reason, accepted = document_job_outcome(response, attempts)
+            # Atomically finish this job and schedule the next reminder. If this
+            # transaction fails, the send reservation makes recovery a no-send duplicate.
+            if accepted and stage.startswith('reminder') and int(stage[-1]) < 5:
+                schedule_document_sms(cursor, client_id, f'reminder{int(stage[-1])+1}')
+            cursor.execute("""UPDATE dbo.ClientDocumentSmsJobs SET State=?,Result=?,
+                AvailableAt=CASE WHEN ?='pending' THEN DATEADD(minute,5,SYSUTCDATETIME()) ELSE AvailableAt END
+                WHERE Id=? AND Attempts=?""", status, reason, status, job_id, attempts)
+            conn.commit()
+            logging.info('Document SMS job stage=%s state=%s result=%s',stage,status,reason)
+        except Exception:
+            logging.error('Document SMS job interrupted; durable lease retained.')
+            return
+        finally:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            for resource in (cursor,conn):
+                if resource:
+                    try:
+                        resource.close()
+                    except Exception:
+                        pass
+
+
 def register_sms(app, connect, document_status, ghl_headers):
     @app.route(route='sms/document-stage', methods=['POST'], auth_level=func.AuthLevel.ANONYMOUS)
     def document_sms(req):
@@ -320,3 +440,4 @@ def register_sms(app, connect, document_status, ghl_headers):
                        run_on_startup=False, use_monitor=True)
     def submission_sms_jobs(timer: func.TimerRequest):
         process_submission_jobs(connect, document_sms)
+        process_document_jobs(connect, document_sms)

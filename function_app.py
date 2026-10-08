@@ -1345,7 +1345,7 @@ def get_client_document_status(cursor, client_id: int):
     uploaded_raw = [
         normalize_document_type(row.DocumentType)
         for row in rows
-        if row.DocumentType
+        if row.DocumentType and (row.Status or "").strip().lower() not in ("rejected", "declined", "failed")
     ]
 
     verified_raw = [
@@ -3315,6 +3315,7 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
                 "Pending",
             ))
             uploaded_document_id = cursor.fetchone()[0]
+            schedule_document_sms(cursor, client_id, "received", uploaded_document_id)
 
             cursor.execute("""
                 UPDATE Clients
@@ -3470,6 +3471,7 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
             ))
             if is_initial_submission and ghl_contact_id and isinstance(ghl_sync, dict) and ghl_sync.get("success"):
                 schedule_submission_sms(cursor, client_id)
+                schedule_document_sms(cursor, client_id, "reminder1")
                 submission_sms_scheduled = True
             conn.commit()
             cursor.close()
@@ -6954,5 +6956,5 @@ def privacy_document(req: func.HttpRequest) -> func.HttpResponse:
         close_sql_resources(cursor, conn)
 
 # Server-to-server SMS integration; sending remains disabled by default.
-from sms_integration import register_sms, schedule_submission_sms, phone_number
+from sms_integration import register_sms, schedule_submission_sms, schedule_document_sms, phone_number
 register_sms(app, get_sql_connection, get_client_document_status, get_ghl_headers)
