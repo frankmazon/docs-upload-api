@@ -155,5 +155,54 @@ class SmsTests(unittest.TestCase):
             sms.phone_number('not a phone')
 
 
+class SubmissionJobTests(unittest.TestCase):
+    def setUp(self):
+        self.env = patch.dict(os.environ, {'SMS_SENDING_ENABLED': 'true', 'SMS_WEBHOOK_SECRET': 'test-secret'})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.conn = Mock()
+        self.cursor = self.conn.cursor.return_value
+        self.connect = Mock(return_value=self.conn)
+        self.handler = Mock()
+
+    def run_job(self, result, code=200, attempts=1):
+        self.cursor.fetchone.side_effect = [(1,), (42, attempts), ('CL-TEST',), (1,), None]
+        self.handler.return_value = sms.func.HttpResponse(json.dumps(result), status_code=code)
+        sms.process_submission_jobs(self.connect, self.handler)
+        updates = [c.args for c in self.cursor.execute.call_args_list if 'SET State=?, Result=?' in c.args[0]]
+        return updates[-1][1:]
+
+    def test_job_uses_same_guarded_live_handler(self):
+        self.assertEqual(self.run_job({'state': 'queued'}), ('done', 'queued', 42, 1))
+        req = self.handler.call_args.args[0]
+        self.assertEqual(req.get_json(), {'clientId': 'CL-TEST', 'stage': 'submission', 'dryRun': False})
+        self.assertEqual(req.headers['Authorization'], 'Bearer test-secret')
+
+    def test_unknown_delivery_never_retried(self):
+        self.assertEqual(self.run_job({'state': 'unknown'})[0], 'failed')
+        self.handler.assert_called_once()
+
+    def test_existing_webhook_reservation_completes_job_without_resend(self):
+        self.assertEqual(self.run_job({'state': 'duplicate', 'previousState': 'queued'})[0], 'done')
+
+    def test_missing_phone_is_terminal(self):
+        self.assertEqual(self.run_job({'state': 'blocked', 'reason': 'missing_ghl_phone'}, 409)[:2], ('failed', 'missing_ghl_phone'))
+
+    def test_temporary_errors_have_bounded_retry(self):
+        self.assertEqual(self.run_job({'error': 'unavailable'}, 503)[0], 'pending')
+        self.assertEqual(self.run_job({'error': 'unavailable'}, 503, attempts=3)[0], 'failed')
+
+    def test_disabled_never_claims_jobs(self):
+        os.environ['SMS_SENDING_ENABLED'] = 'false'
+        sms.process_submission_jobs(self.connect, self.handler)
+        self.connect.assert_not_called()
+        self.handler.assert_not_called()
+
+    def test_no_table_does_not_backfill_clients(self):
+        self.cursor.fetchone.return_value = (None,)
+        sms.process_submission_jobs(self.connect, self.handler)
+        self.handler.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()

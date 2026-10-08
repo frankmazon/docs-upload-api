@@ -1,3 +1,13 @@
+## Website submission SMS jobs (2026-10-08)
+
+New initial website submissions now schedule a durable `ClientSmsJobs` row in the same transaction that saves the GHL contact link. A monitored timer processes jobs once per minute through the existing guarded SMS handler. This removes the dependency on a fresh GHL workflow enrollment for submission SMS; existing contacts can remain in their reminder workflow. Partial document uploads do not schedule a new submission SMS.
+
+The GHL webhook can remain: both paths share `ClientSmsEvents` reservations and cannot send the same client/stage twice. Opt-outs, contact identity, matching phone and the server sending switch remain enforced. Temporary pre-send errors have at most three job attempts; ambiguous provider outcomes are never resent automatically. Inspect `ClientSmsJobs.State/Result` and `ClientSmsEvents.State/ProviderId` when diagnosing delivery. Old submissions are not backfilled. Do not delete records to retry.
+
+Phone values are normalized before GHL upsert. The API response includes `submissionSmsScheduled`; this indicates durable scheduling, not delivery. Provider reports remain the source for confirmed delivery. The older synchronous webhook timeout may still appear in GHL; the submission job runs independently.
+
+Timer reference: https://learn.microsoft.com/en-us/azure/azure-functions/functions-bindings-timer?pivots=programming-language-python
+
 ## Live test and activation (2026-10-08)
 
 User authorized one live test to their Australian mobile ending 5441 and plans a website test next.

@@ -2205,7 +2205,7 @@ def sync_client_to_ghl(
             "firstName": clean_value(first_name),
             "lastName": clean_value(last_name),
             "email": clean_value(email),
-            "phone": clean_value(phone),
+            "phone": phone_number(phone) if clean_value(phone) else "",
             "source": source_label or "Website Intake",
             "tags": tags,
         }
@@ -3447,16 +3447,7 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
             "message": "Not an initial submission, GHL sync failed, or GHL contact was not resolved.",
         }
 
-        if (
-            is_initial_submission
-            and isinstance(ghl_sync, dict)
-            and ghl_sync.get("success")
-            and ghl_contact_id
-        ):
-            ghl_submission_trigger = start_submission_workflow(
-                ghl_contact_id,
-            )
-
+        submission_sms_scheduled = False
         try:
             ghl_location_id = os.getenv("GHL_LOCATION_ID", "").strip()
 
@@ -3477,16 +3468,35 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
                 "Pending Team Call",
                 client_id,
             ))
+            if is_initial_submission and ghl_contact_id and isinstance(ghl_sync, dict) and ghl_sync.get("success"):
+                schedule_submission_sms(cursor, client_id)
+                submission_sms_scheduled = True
             conn.commit()
             cursor.close()
             conn.close()
         except Exception:
+            submission_sms_scheduled = False
+            if conn:
+                conn.rollback()
+            close_sql_resources(cursor, conn)
             logging.exception("Failed to update GHL sync metadata on client record.")
+
+        if (
+            is_initial_submission
+            and isinstance(ghl_sync, dict)
+            and ghl_sync.get("success")
+            and ghl_contact_id
+        ):
+            ghl_submission_trigger = start_submission_workflow(
+                ghl_contact_id,
+            )
+
 
         return add_cors(func.HttpResponse(
             json.dumps({
                 "success": True,
                 "message": "Client application submitted successfully.",
+                "submissionSmsScheduled": submission_sms_scheduled,
                 "clientId": client_id,
                 "uniqueId": unique_id,
                 "blobUrl": blob_url,
@@ -6944,5 +6954,5 @@ def privacy_document(req: func.HttpRequest) -> func.HttpResponse:
         close_sql_resources(cursor, conn)
 
 # Server-to-server SMS integration; sending remains disabled by default.
-from sms_integration import register_sms
+from sms_integration import register_sms, schedule_submission_sms, phone_number
 register_sms(app, get_sql_connection, get_client_document_status, get_ghl_headers)

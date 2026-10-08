@@ -102,6 +102,102 @@ def ensure_table(cursor):
     """)
 
 
+def schedule_submission_sms(cursor, client_id):
+    """Persist with the contact link transaction; never backfill old submissions."""
+    cursor.execute("""
+        DECLARE @lock int;
+        EXEC @lock = sp_getapplock @Resource='SbrSmsJobsSchema',
+             @LockMode='Exclusive', @LockOwner='Transaction', @LockTimeout=10000;
+        IF @lock < 0 THROW 51000, 'SMS jobs schema lock unavailable', 1;
+        IF OBJECT_ID('dbo.ClientSmsJobs', 'U') IS NULL
+        CREATE TABLE dbo.ClientSmsJobs (
+            ClientId int PRIMARY KEY REFERENCES dbo.Clients(Id) ON DELETE CASCADE,
+            State varchar(16) NOT NULL DEFAULT 'pending',
+            Attempts int NOT NULL DEFAULT 0,
+            AvailableAt datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
+            Result varchar(80) NULL
+        );
+    """)
+    cursor.execute("""
+        IF NOT EXISTS (SELECT 1 FROM dbo.ClientSmsJobs WITH (UPDLOCK, HOLDLOCK) WHERE ClientId=?)
+        INSERT INTO dbo.ClientSmsJobs(ClientId) VALUES (?)
+    """, client_id, client_id)
+
+
+def process_submission_jobs(connect, handler):
+    """Leased jobs survive restarts; provider reservations prevent ambiguous retries."""
+    if os.getenv('SMS_SENDING_ENABLED', '').lower() != 'true':
+        return
+    secret = os.getenv('SMS_WEBHOOK_SECRET', '')
+    if not secret:
+        return
+    for _ in range(5):
+        conn = cursor = None
+        try:
+            conn = connect(query_timeout=15)
+            cursor = conn.cursor()
+            cursor.execute("SELECT OBJECT_ID('dbo.ClientSmsJobs', 'U')")
+            if not cursor.fetchone()[0]:
+                return
+            cursor.execute("""
+                UPDATE dbo.ClientSmsJobs SET State='failed', Result='lease_exhausted'
+                WHERE State='processing' AND Attempts >= 3 AND AvailableAt <= SYSUTCDATETIME()
+            """)
+            cursor.execute("""
+                ;WITH next_job AS (
+                    SELECT TOP (1) * FROM dbo.ClientSmsJobs WITH (UPDLOCK, READPAST, READCOMMITTEDLOCK)
+                    WHERE State IN ('pending', 'processing') AND Attempts < 3
+                      AND AvailableAt <= SYSUTCDATETIME()
+                    ORDER BY AvailableAt
+                )
+                UPDATE next_job SET State='processing', Attempts=Attempts+1,
+                    AvailableAt=DATEADD(minute,5,SYSUTCDATETIME())
+                OUTPUT INSERTED.ClientId, INSERTED.Attempts
+            """)
+            job = cursor.fetchone()
+            if not job:
+                conn.commit()
+                return
+            client_id, attempts = job[0], job[1]
+            cursor.execute('SELECT UniqueId FROM dbo.Clients WHERE Id=?', client_id)
+            client = cursor.fetchone()
+            conn.commit()
+            if not client:
+                continue
+            req = func.HttpRequest(method='POST', url='/api/sms/document-stage',
+                headers={'Authorization': 'Bearer ' + secret},
+                body=json.dumps({'clientId': client[0], 'stage': 'submission', 'dryRun': False}).encode())
+            response = handler(req)
+            result = json.loads(response.get_body())
+            state = result.get('state', 'error')
+            # Only errors before/around a reservation are retried. The handler
+            # refuses to resend any existing reservation, including unknown.
+            retry = response.status_code >= 500 and attempts < 3
+            job_state = 'pending' if retry else ('done' if state in ('queued', 'duplicate', 'skipped') else 'failed')
+            cursor.execute("""
+                UPDATE dbo.ClientSmsJobs SET State=?, Result=?,
+                    AvailableAt=DATEADD(minute,2,SYSUTCDATETIME())
+                WHERE ClientId=? AND Attempts=?
+            """, job_state, str(result.get('reason', state))[:80], client_id, attempts)
+            conn.commit()
+            logging.info('Submission SMS job completed: state=%s result=%s', job_state, state)
+        except Exception:
+            logging.error('Submission SMS job interrupted; durable lease retained.')
+            return
+        finally:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            for resource in (cursor, conn):
+                if resource:
+                    try:
+                        resource.close()
+                    except Exception:
+                        pass
+
+
 def register_sms(app, connect, document_status, ghl_headers):
     @app.route(route='sms/document-stage', methods=['POST'], auth_level=func.AuthLevel.ANONYMOUS)
     def document_sms(req):
@@ -219,3 +315,8 @@ def register_sms(app, connect, document_status, ghl_headers):
                         resource.close()
                     except Exception:
                         pass
+
+    @app.timer_trigger(schedule='0 * * * * *', arg_name='timer',
+                       run_on_startup=False, use_monitor=True)
+    def submission_sms_jobs(timer: func.TimerRequest):
+        process_submission_jobs(connect, document_sms)
