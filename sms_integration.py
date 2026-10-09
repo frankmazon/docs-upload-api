@@ -10,6 +10,7 @@ import azure.functions as func
 import requests
 
 TEMPLATES = {
+    'referral': "Hi {name}, thanks for your referral. We've received the client submission and our team will review it.",
     'submission': "Hi {name}, thanks for submitting your scenario to SBR Funding. We've emailed your next steps. Upload your documents here: https://dashboard.sbrfunding.com.au/clients",
     'received': "Hi {name}, thanks for sending through your document(s). We've received them and will review them as part of your initial checks. We'll let you know if anything further is required.",
     'reminder1': "Hi {name}, just a quick reminder that we're still waiting on some outstanding documents for your scenario. Please upload the remaining documents when you can so we can keep things moving. Thank you!",
@@ -200,7 +201,7 @@ def process_submission_jobs(connect, handler):
 
 def schedule_document_sms(cursor, client_id, stage, document_id=0):
     """Enqueue only explicit new uploads/submissions; never reset an existing job."""
-    if stage != 'received' and stage not in {f'reminder{i}' for i in range(1, 6)}:
+    if stage not in ('received', 'referral') and stage not in {f'reminder{i}' for i in range(1, 6)}:
         raise ValueError('Invalid document SMS stage')
     if stage == 'received' and document_id <= 0:
         raise ValueError('A saved document is required')
@@ -222,7 +223,7 @@ def schedule_document_sms(cursor, client_id, stage, document_id=0):
             CONSTRAINT UQ_ClientDocumentSmsJob UNIQUE(ClientId,Stage,DocumentId)
         );
     """)
-    if stage == 'received':
+    if stage in ('received', 'referral'):
         due = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=1)
     elif stage == 'reminder1':
         cursor.execute('SELECT SubmittedAt FROM dbo.Clients WHERE Id=?', client_id)
@@ -361,18 +362,26 @@ def register_sms(app, connect, document_status, ghl_headers):
                 cursor.execute('SELECT Id FROM dbo.Documents WHERE Id=? AND ClientId=?', document_id, client.Id)
                 if not cursor.fetchone():
                     return reply({'error': 'Document does not belong to client'}, 400)
-            phone = phone_number(client.Phone)
-            text = message_text(stage, client.FirstName)
+            recipient = client
+            if stage == 'referral':
+                cursor.execute('''SELECT r.FirstName, r.Phone, r.GHLContactId, r.IsActive
+                    FROM dbo.Referrers r JOIN dbo.Clients c ON c.ReferrerAccountId=r.Id
+                    WHERE c.Id=?''', client.Id)
+                recipient = cursor.fetchone()
+                if not recipient or not recipient.IsActive:
+                    return reply({'state': 'skipped', 'reason': 'referrer_inactive_or_missing'})
+            phone = phone_number(recipient.Phone)
+            text = message_text(stage, recipient.FirstName)
             # Finish the read transaction before making a network request.
             conn.commit()
-            if not client.GHLContactId:
+            if not recipient.GHLContactId:
                 return reply({'state': 'blocked', 'reason': 'missing_ghl_contact'}, 409)
             contact_response = requests.get(
-                'https://services.leadconnectorhq.com/contacts/' + str(client.GHLContactId),
+                'https://services.leadconnectorhq.com/contacts/' + str(recipient.GHLContactId),
                 headers=ghl_headers(), timeout=(5, 15))
             contact_response.raise_for_status()
             contact = contact_response.json().get('contact', {})
-            if contact.get('id') != client.GHLContactId or blocked_contact(contact):
+            if contact.get('id') != recipient.GHLContactId or blocked_contact(contact):
                 return reply({'state': 'skipped', 'reason': 'contact_opted_out_or_unverified'})
             # Avoid delivering to a stale number whose consent cannot be checked.
             if not contact.get('phone'):

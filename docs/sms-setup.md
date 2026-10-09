@@ -1,3 +1,13 @@
+## Referrer notifications (2026-10-09)
+
+Initial referred submissions continue to invoke the existing published GHL workflows `Referrer – New Client Submission` and, for a newly created RF account, `Referrer – Account Created`. The backend now reports a failed tag trigger as an unsuccessful notification even when the contact upsert succeeds. Published status was verified via the GHL API; workflow action internals and end-to-end email delivery were not available for verification.
+
+After saving the referrer's GHL contact link, a `referral` job is scheduled in `ClientDocumentSmsJobs` when the referrer has a phone. It sends: "Hi [First Name], thanks for your referral. We've received the client submission and our team will review it. - SBR Funding". The recipient comes from the client's linked Referrers row, and its active status, GHL phone match and SMS opt-out state are checked. There is one SMS per referred client submission; document uploads and borrower reminders do not notify the referrer. No existing referrals are backfilled.
+
+Phone normalization is applied on referrer contact upsert. A missing or invalid phone does not prevent the email workflow trigger; invalid phone SMS jobs fail without sending. Referral jobs use the same durable leases and send reservations as document SMS. No new GHL SMS action is required.
+
+Validation: 65 tests passed, including referrer recipient selection, opt-out, inactive referrer, duplicate reservation, email without phone, normalization and failed email trigger reporting. No live messages were sent for validation.
+
 ## Document receipts and reminders (2026-10-08)
 
 Every newly saved document queues one `received` SMS in `ClientDocumentSmsJobs`, in the upload transaction. A retry of the SMS job cannot send that document's acknowledgment twice. Separate uploaded files each have their own acknowledgment. Receipt jobs have a one-minute delay to allow initial GHL synchronization.

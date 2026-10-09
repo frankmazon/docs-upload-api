@@ -2509,10 +2509,14 @@ def notify_referrer_via_ghl(referrer, client_name):
             "firstName": clean_value(referrer.get("firstName")),
             "lastName": clean_value(referrer.get("lastName")),
             "email": clean_value(referrer.get("email")),
-            "phone": clean_value(referrer.get("phone")),
             "source": "SBR Referral Submission",
             "tags": tags,
         }
+        if clean_value(referrer.get("phone")):
+            try:
+                payload["phone"] = phone_number(referrer.get("phone"))
+            except ValueError:
+                logging.warning("Referrer phone invalid; email synchronization will continue.")
         if custom_fields:
             payload["customFields"] = custom_fields
 
@@ -2534,7 +2538,8 @@ def notify_referrer_via_ghl(referrer, client_name):
                 triggers.append(retrigger_ghl_tag(contact_id, GHL_REFERRER_ACCOUNT_CREATED_TAG))
 
         return {
-            "success": response.status_code in (200, 201),
+            "success": bool(contact_id) and response.status_code in (200, 201) and bool(triggers) and all(t.get("success") for t in triggers),
+            "contactSynced": bool(contact_id) and response.status_code in (200, 201),
             "statusCode": response.status_code,
             "contactId": contact_id,
             "clientName": client_name,
@@ -3426,6 +3431,8 @@ def uploadclient(req: func.HttpRequest) -> func.HttpResponse:
                         referrer_contact_id,
                         referrer_account["id"],
                     )
+                    if clean_value(referrer_account.get("phone")):
+                        schedule_document_sms(ref_cursor, client_id, "referral")
                     ref_conn.commit()
                     ref_cursor.close()
                     ref_conn.close()

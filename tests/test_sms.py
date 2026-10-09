@@ -155,6 +155,43 @@ class SmsTests(unittest.TestCase):
             sms.phone_number('not a phone')
 
 
+    def referral_recipient(self):
+        recipient=SimpleNamespace(FirstName='Referrer',Phone='0422333444',GHLContactId='ref-abc',IsActive=True)
+        self.get.return_value.json.return_value={'contact':{'id':'ref-abc','phone':'+61422333444'}}
+        return recipient
+
+    def test_referral_targets_referrer_instead_of_borrower(self):
+        os.environ['SMS_SENDING_ENABLED']='true'
+        self.cursor.fetchone.side_effect=[self.client,self.referral_recipient(),(1,),None,(22,)]
+        self.post.return_value.status_code=200
+        self.post.return_value.json.return_value={'Result':'0000','Messages':{'1':{'Result':'0000','SMSId':222}}}
+        self.assertEqual(self.request(stage='referral',dryRun=False)[1]['state'],'queued')
+        sent=self.post.call_args.kwargs['json']['Messages']['1']
+        self.assertEqual(sent['DestTn'],'+61422333444')
+        self.assertIn('Hi Referrer, thanks for your referral',sent['SMSText'])
+        self.assertTrue(self.get.call_args.args[0].endswith('/ref-abc'))
+
+    def test_referrer_opt_out_blocks_referral_sms(self):
+        ref=self.referral_recipient()
+        self.get.return_value.json.return_value['contact']['dnd']=True
+        self.cursor.fetchone.side_effect=[self.client,ref]
+        self.assertEqual(self.request(stage='referral',dryRun=False)[1]['state'],'skipped')
+        self.post.assert_not_called()
+
+    def test_inactive_referrer_is_not_sent_borrower_sms(self):
+        ref=self.referral_recipient();ref.IsActive=False
+        self.cursor.fetchone.side_effect=[self.client,ref]
+        self.assertEqual(self.request(stage='referral',dryRun=False)[1]['reason'],'referrer_inactive_or_missing')
+        self.post.assert_not_called()
+        self.get.assert_not_called()
+
+    def test_referrer_duplicate_does_not_send_again(self):
+        os.environ['SMS_SENDING_ENABLED']='true'
+        self.cursor.fetchone.side_effect=[self.client,self.referral_recipient(),(1,),SimpleNamespace(State='queued')]
+        self.assertEqual(self.request(stage='referral',dryRun=False)[1]['state'],'duplicate')
+        self.post.assert_not_called()
+
+
 class SubmissionJobTests(unittest.TestCase):
     def setUp(self):
         self.env = patch.dict(os.environ, {'SMS_SENDING_ENABLED': 'true', 'SMS_WEBHOOK_SECRET': 'test-secret'})
