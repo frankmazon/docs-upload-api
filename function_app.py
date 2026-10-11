@@ -6970,7 +6970,7 @@ def privacy_document(req: func.HttpRequest) -> func.HttpResponse:
                 pass
         close_sql_resources(cursor, conn)
 
-@app.route(route="admin-privacy-document", auth_level=func.AuthLevel.ANONYMOUS, methods=["GET", "OPTIONS"])
+@app.route(route="privacy-document-admin", auth_level=func.AuthLevel.ANONYMOUS, methods=["GET", "OPTIONS"])
 def admin_privacy_document(req: func.HttpRequest) -> func.HttpResponse:
     if req.method == 'OPTIONS':
         return add_cors(func.HttpResponse('', status_code=204))

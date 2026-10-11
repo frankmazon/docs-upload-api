@@ -102,3 +102,11 @@ class AdminPrivacyTests(unittest.TestCase):
         cursor.fetchone.side_effect=[(3,),(json.dumps(saved),)]
         self.assertEqual(ns['privacy_document'](req)[0],200)
         ns['create_admin_notification'].assert_called_once()
+
+    def test_admin_privacy_route_avoids_azure_reserved_prefixes(self):
+        import ast
+        from test_reliability import SOURCE
+        tree=ast.parse(SOURCE.read_text())
+        handler=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='admin_privacy_document')
+        route=next(k.value.value for d in handler.decorator_list for k in d.keywords if k.arg=='route')
+        self.assertFalse(route.strip('/').lower().startswith(('admin','runtime')))
