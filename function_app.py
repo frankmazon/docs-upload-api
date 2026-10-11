@@ -343,10 +343,10 @@ def ensure_admin_notifications_table(cursor):
 
 def create_admin_notification(
     cursor, *, client_id, unique_id, client_name, title, message,
-    notification_type, document_type="", source="", document_id=None
+    notification_type, document_type="", source="", document_id=None, redirect_to=None
 ):
     ensure_admin_notifications_table(cursor)
-    redirect_to = (
+    redirect_to = redirect_to or (
         "/dashboard/client-search?"
         f"clientId={quote(str(client_id))}&uniqueId={quote(unique_id or '')}"
     )
@@ -6947,6 +6947,14 @@ def privacy_document(req: func.HttpRequest) -> func.HttpResponse:
         cursor.execute("""INSERT INTO dbo.ClientPrivacyDocuments
             (ClientId, DocumentId, TemplateVersion, DocumentJson) VALUES (?, ?, ?, ?)""",
             session['id'], document['id'], 1, json.dumps(document))
+        submission = document['submission']
+        client_name = submission['borrowers'][0]['name']
+        create_admin_notification(cursor, client_id=session['id'],
+            unique_id=submission['uniqueId'], client_name=client_name,
+            title='Privacy Authority Signed',
+            message=f"{client_name}'s Privacy Statement and Authority has been signed by all listed borrowers.",
+            notification_type='privacy', document_type='Privacy Authority',
+            source='Client Portal', redirect_to=f"/dashboard/privacy-authority/{session['id']}")
         conn.commit()
         return chat_response(document)
     except ValueError as exc:
@@ -6961,6 +6969,48 @@ def privacy_document(req: func.HttpRequest) -> func.HttpResponse:
             except Exception:
                 pass
         close_sql_resources(cursor, conn)
+
+@app.route(route="admin/privacy-document", auth_level=func.AuthLevel.ANONYMOUS, methods=["GET", "OPTIONS"])
+def admin_privacy_document(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == 'OPTIONS':
+        return add_cors(func.HttpResponse('', status_code=204))
+    session = read_chat_session(req)
+    if not session or session['role'] != 'Admin':
+        return chat_response({'message': 'Please sign in as an administrator.'}, 401)
+    conn = cursor = None
+    try:
+        client_arg = req.params.get('clientId')
+        client_id = int(client_arg) if client_arg is not None else None
+        if client_id is not None and client_id <= 0:
+            raise ValueError('Invalid client ID.')
+        conn = get_sql_connection(query_timeout=30)
+        cursor = conn.cursor()
+        ensure_privacy_documents_table(cursor)
+        conn.commit()
+        if client_id is None:
+            cursor.execute('SELECT ClientId, SignedAt FROM dbo.ClientPrivacyDocuments')
+            return chat_response({'documents': [{'clientId': r.ClientId, 'signedAt': r.SignedAt.isoformat()+'Z'} for r in cursor.fetchall()]})
+        cursor.execute('SELECT DocumentJson FROM dbo.ClientPrivacyDocuments WHERE ClientId=?', client_id)
+        saved = cursor.fetchone()
+        if saved:
+            return chat_response(json.loads(saved[0]))
+        document = privacy_submission(cursor, client_id)
+        if document is None:
+            return chat_response({'message': 'Client submission not found.'}, 404)
+        return chat_response(document)
+    except (ValueError, TypeError):
+        return chat_response({'message': 'The client details are invalid or incomplete. Please review the submission.'}, 400)
+    except Exception:
+        logging.exception('Admin privacy document request failed.')
+        return chat_response({'message': 'Unable to load the privacy document. Please try again.'}, 503)
+    finally:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        close_sql_resources(cursor, conn)
+
 
 # Server-to-server SMS integration; sending remains disabled by default.
 from sms_integration import register_sms, schedule_submission_sms, schedule_document_sms, phone_number
